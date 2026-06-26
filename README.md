@@ -8,6 +8,8 @@ A secure, self-hosted feature flag and remote configuration service with full [O
 - **Secrets Management**: Encrypted configuration secrets (API tokens, passwords) with AES-256-GCM encryption at rest
 - **Secret Feature Flags**: Flags whose variation values reference stored secrets (`{"$secret": "KEY"}`), resolved to decrypted values at evaluation time — use targeting rules to serve different secrets per user/environment
 - **Dual Authentication**: OIDC (admin UI) + API keys (programmatic SDK access)
+- **Hardcoded Admin**: Email/password admin login via `ADMIN_EMAIL`/`ADMIN_PASSWORD` env vars
+- **Organizations**: Multi-tenant orgs with member management and role-based access control (owner/admin/member/viewer)
 - **Environments**: Per-environment flag overrides (production, staging, etc.)
 - **Segments**: Reusable targeting segments for audience management
 - **Audit Logging**: Every change is tracked with actor, action, and timestamp
@@ -57,6 +59,8 @@ The Vite dev server proxies API calls to `:8080`.
 | `OIDC_CLIENT_ID` | (none) | OIDC client ID |
 | `OIDC_CLIENT_SECRET` | (none) | OIDC client secret |
 | `OIDC_REDIRECT_URL` | (none) | OIDC redirect URL |
+| `ADMIN_EMAIL` | (none) | Hardcoded admin email for password login |
+| `ADMIN_PASSWORD` | (none) | Hardcoded admin password |
 | `SECRETS_KEY` | (derived from JWT_SECRET) | Encryption key for secrets at rest (min 32 chars) |
 | `APP_ENV` | (none) | Set to `production` for prod mode |
 

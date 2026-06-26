@@ -2,15 +2,32 @@ import { useState, useEffect } from "react";
 import { api, setToken } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
+import { Input, Label } from "@/components/ui/form";
 
 export function LoginPage({ onLogin }: { onLogin: () => void }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [oidcConfigured, setOidcConfigured] = useState(false);
+  const [oidcAvailable, setOidcAvailable] = useState(false);
 
   useEffect(() => {
-    api.oidcStart().then(() => setOidcConfigured(true)).catch(() => setOidcConfigured(false));
+    api.oidcStart().then(() => setOidcAvailable(true)).catch(() => setOidcAvailable(false));
   }, []);
+
+  const handleAdminLogin = async () => {
+    try {
+      setLoading(true);
+      setError("");
+      const { token } = await api.adminLogin({ email, password });
+      setToken(token);
+      onLogin();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Login failed");
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleOIDC = async () => {
     try {
@@ -24,7 +41,7 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
     }
   };
 
-  // Handle callback from OIDC redirect
+  // Handle OIDC callback
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const code = params.get("code");
@@ -48,7 +65,7 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
       } else {
         setError(data.error || "Authentication failed");
       }
-    } catch (err) {
+    } catch {
       setError("Callback failed");
     } finally {
       setLoading(false);
@@ -68,15 +85,50 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
               {error}
             </div>
           )}
-          {oidcConfigured ? (
-            <Button onClick={handleOIDC} disabled={loading} className="w-full" size="lg">
-              {loading ? "Connecting..." : "Sign in with OIDC"}
-            </Button>
-          ) : (
-            <div className="text-center text-sm text-[var(--color-muted-foreground)]">
-              <p>OIDC not configured.</p>
-              <p className="mt-2">Set OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, and OIDC_REDIRECT_URL environment variables.</p>
+
+          {/* Admin login form */}
+          <div className="space-y-3">
+            <div className="space-y-1">
+              <Label>Email</Label>
+              <Input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="admin@example.com"
+              />
             </div>
+            <div className="space-y-1">
+              <Label>Password</Label>
+              <Input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") handleAdminLogin(); }}
+                placeholder="••••••••"
+              />
+            </div>
+            <Button onClick={handleAdminLogin} disabled={loading} className="w-full" size="lg">
+              {loading ? "Signing in..." : "Sign in"}
+            </Button>
+          </div>
+
+          {oidcAvailable && (
+            <>
+              <div className="flex items-center gap-3">
+                <div className="flex-1 h-px bg-[var(--color-border)]" />
+                <span className="text-xs text-[var(--color-muted-foreground)]">OR</span>
+                <div className="flex-1 h-px bg-[var(--color-border)]" />
+              </div>
+              <Button onClick={handleOIDC} variant="outline" className="w-full">
+                Sign in with OIDC
+              </Button>
+            </>
+          )}
+
+          {!oidcAvailable && (
+            <p className="text-center text-xs text-[var(--color-muted-foreground)]">
+              Admin login via ADMIN_EMAIL / ADMIN_PASSWORD env vars.
+            </p>
           )}
         </CardContent>
       </Card>

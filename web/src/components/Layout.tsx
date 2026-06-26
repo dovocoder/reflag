@@ -1,5 +1,5 @@
 import React from "react";
-import { Flag, Globe, Users, Key, Lock, ScrollText, LogOut, Menu } from "lucide-react";
+import { Flag, Globe, Users, Key, Lock, ScrollText, LogOut, Menu, Building2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 interface LayoutProps {
@@ -15,6 +15,7 @@ const navItems = [
   { page: "segments", path: "/segments", label: "Segments", icon: Users },
   { page: "secrets", path: "/secrets", label: "Secrets", icon: Lock },
   { page: "api-keys", path: "/api-keys", label: "API Keys", icon: Key },
+  { page: "organizations", path: "/organizations", label: "Orgs", icon: Building2 },
   { page: "audit", path: "/audit", label: "Audit", icon: ScrollText },
 ];
 

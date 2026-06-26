@@ -9,6 +9,7 @@ import { SegmentsPage } from "./pages/SegmentsPage";
 import { ApiKeysPage } from "./pages/ApiKeysPage";
 import { AuditPage } from "./pages/AuditPage";
 import { SecretsPage } from "./pages/SecretsPage";
+import { OrganizationsPage } from "./pages/OrganizationsPage";
 import { LoginPage } from "./pages/LoginPage";
 import { Layout } from "./components/Layout";
 import { isAuthenticated, clearToken } from "./lib/api";
@@ -28,6 +29,7 @@ type Route =
   | { page: "segments" }
   | { page: "api-keys" }
   | { page: "secrets" }
+  | { page: "organizations" }
   | { page: "audit" };
 
 function parseRoute(): Route {
@@ -46,6 +48,7 @@ function parseRoute(): Route {
   if (path === "/segments") return { page: "segments" };
   if (path === "/api-keys") return { page: "api-keys" };
   if (path === "/secrets") return { page: "secrets" };
+  if (path === "/organizations") return { page: "organizations" };
   if (path === "/audit") return { page: "audit" };
   return { page: "flags" };
 }
@@ -95,6 +98,9 @@ function App() {
       break;
     case "secrets":
       pageContent = <SecretsPage />;
+      break;
+    case "organizations":
+      pageContent = <OrganizationsPage />;
       break;
     case "audit":
       pageContent = <AuditPage />;

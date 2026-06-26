@@ -113,11 +113,34 @@ type AuditLogEntry struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-// User represents an authenticated admin user (from OIDC).
+// User represents an authenticated admin user (from OIDC or hardcoded admin).
 type User struct {
 	ID    string `json:"id"`
 	Email string `json:"email"`
 	Name  string `json:"name"`
+	Role  string `json:"role"` // admin, owner, member, viewer
+}
+
+// Organization represents a tenant/workspace that owns flags, secrets, etc.
+type Organization struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Slug        string    `json:"slug"`
+	Description string    `json:"description"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// OrgMember represents a user's membership in an organization with a role.
+type OrgMember struct {
+	ID             string    `json:"id"`
+	UserID         string    `json:"user_id"`
+	OrgID          string    `json:"org_id"`
+	Role           string    `json:"role"` // owner, admin, member, viewer
+	CreatedAt      time.Time `json:"created_at"`
+	// Joined fields (populated by queries)
+	UserName  string `json:"user_name,omitempty"`
+	UserEmail string `json:"user_email,omitempty"`
 }
 
 // Secret represents an encrypted configuration secret (e.g., API tokens, passwords).

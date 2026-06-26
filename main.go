@@ -39,6 +39,7 @@ func main() {
 
 	// Initialize auth service
 	authSvc := auth.New(st, cfg.JWTSecret, cfg.OIDCIssuer, cfg.OIDCClientID, cfg.OIDCClientSec, cfg.OIDCRedirect)
+	authSvc.SetAdminCredentials(cfg.AdminEmail, cfg.AdminPassword)
 
 	// Initialize API handlers
 	handler := api.NewHandler(st, authSvc, cfg.SecretsKey)

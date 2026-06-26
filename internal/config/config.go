@@ -17,6 +17,9 @@ type Config struct {
 	OIDCRedirect  string
 	// Encryption key for secrets at rest (derived from JWT_SECRET or SECRETS_KEY)
 	SecretsKey     string
+	// Hardcoded admin credentials (env: ADMIN_EMAIL, ADMIN_PASSWORD)
+	AdminEmail    string
+	AdminPassword string
 	IsProduction  bool
 }
 
@@ -57,6 +60,8 @@ func Load() *Config {
 		OIDCClientSec: os.Getenv("OIDC_CLIENT_SECRET"),
 		OIDCRedirect:  os.Getenv("OIDC_REDIRECT_URL"),
 		SecretsKey:     secretsKey,
+		AdminEmail:    os.Getenv("ADMIN_EMAIL"),
+		AdminPassword: os.Getenv("ADMIN_PASSWORD"),
 		IsProduction:  isProd,
 	}
 }

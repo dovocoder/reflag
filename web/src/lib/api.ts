@@ -124,6 +124,32 @@ export interface AuditEntry {
   timestamp: string;
 }
 
+export interface User {
+  id: string;
+  email: string;
+  name: string;
+  role: string;
+}
+
+export interface Organization {
+  id: string;
+  name: string;
+  slug: string;
+  description: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface OrgMember {
+  id: string;
+  user_id: string;
+  org_id: string;
+  role: string;
+  created_at: string;
+  user_name?: string;
+  user_email?: string;
+}
+
 export interface Secret {
   id: string;
   key: string;
@@ -142,6 +168,11 @@ export const api = {
   oidcStart: () =>
     request<{ authorization_url: string; state: string }>("/auth/oidc/start", {
       method: "POST",
+    }),
+  adminLogin: (data: { email: string; password: string }) =>
+    request<{ token: string; user: User }>("/auth/login", {
+      method: "POST",
+      body: JSON.stringify(data),
     }),
 
   // Flags
@@ -197,4 +228,19 @@ export const api = {
     request<Secret>(`/secrets/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   deleteSecret: (id: string) =>
     request<void>(`/secrets/${id}`, { method: "DELETE" }),
+
+  // Organizations
+  listOrgs: () => request<Organization[]>("/organizations"),
+  createOrg: (data: Partial<Organization>) =>
+    request<Organization>("/organizations", { method: "POST", body: JSON.stringify(data) }),
+  deleteOrg: (id: string) =>
+    request<void>(`/organizations/${id}`, { method: "DELETE" }),
+  listOrgMembers: (orgId: string) =>
+    request<OrgMember[]>(`/organizations/${orgId}/members`),
+  addOrgMember: (orgId: string, data: { email: string; role: string }) =>
+    request<OrgMember>(`/organizations/${orgId}/members`, { method: "POST", body: JSON.stringify(data) }),
+  updateOrgMemberRole: (memberId: string, role: string) =>
+    request<{ status: string; role: string }>(`/organizations/members/${memberId}`, { method: "PUT", body: JSON.stringify({ role }) }),
+  removeOrgMember: (memberId: string) =>
+    request<void>(`/organizations/members/${memberId}`, { method: "DELETE" }),
 };

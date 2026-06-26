@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dovocoder/reflag/internal/middleware"
 	"github.com/dovocoder/reflag/internal/models"
 	"github.com/dovocoder/reflag/internal/store"
 	"github.com/golang-jwt/jwt/v5"
@@ -35,6 +36,10 @@ type AuthService struct {
 	oidcClientSec string
 	oidcRedirect  string
 
+	// Hardcoded admin credentials
+	adminEmail    string
+	adminPassword string
+
 	// OIDC discovery cache
 	mu            sync.Mutex
 	discovery     *OIDCDiscovery
@@ -52,6 +57,7 @@ type OIDCDiscovery struct {
 type Claims struct {
 	Email string `json:"email"`
 	Name  string `json:"name"`
+	Role  string `json:"role"`
 	jwt.RegisteredClaims
 }
 
@@ -66,12 +72,23 @@ func New(s *store.Store, jwtSecret, oidcIssuer, oidcClientID, oidcClientSec, oid
 	}
 }
 
+// SetAdminCredentials configures the hardcoded admin account.
+func (a *AuthService) SetAdminCredentials(email, password string) {
+	a.adminEmail = email
+	a.adminPassword = password
+}
+
 // --- JWT ---
 
 func (a *AuthService) GenerateJWT(user *models.User) (string, error) {
+	role := user.Role
+	if role == "" {
+		role = "member"
+	}
 	claims := &Claims{
 		Email: user.Email,
 		Name:  user.Name,
+		Role:  role,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   user.ID,
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
@@ -81,6 +98,27 @@ func (a *AuthService) GenerateJWT(user *models.User) (string, error) {
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(a.jwtSecret))
+}
+
+// LoginAdmin checks hardcoded admin credentials and returns a JWT.
+func (a *AuthService) LoginAdmin(email, password string) (*models.User, string, error) {
+	if a.adminEmail == "" || a.adminPassword == "" {
+		return nil, "", fmt.Errorf("admin login not configured")
+	}
+	if email != a.adminEmail || password != a.adminPassword {
+		return nil, "", fmt.Errorf("invalid credentials")
+	}
+	user := &models.User{
+		ID:    "admin",
+		Email: a.adminEmail,
+		Name:  "Administrator",
+		Role:  "admin",
+	}
+	token, err := a.GenerateJWT(user)
+	if err != nil {
+		return nil, "", err
+	}
+	return user, token, nil
 }
 
 func (a *AuthService) ValidateJWT(tokenStr string) (*Claims, error) {
@@ -304,11 +342,37 @@ func (a *AuthService) JWTMiddleware(next http.Handler) http.Handler {
 			http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
 			return
 		}
-		user := &models.User{ID: claims.Subject, Email: claims.Email, Name: claims.Name}
+		user := &models.User{ID: claims.Subject, Email: claims.Email, Name: claims.Name, Role: claims.Role}
 		ctx := context.WithValue(r.Context(), userKey, user)
 		ctx = context.WithValue(ctx, actorKey, user.Email)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// RequireRole is middleware that checks the authenticated user has one of the allowed roles.
+// Must be used after JWTMiddleware.
+func (a *AuthService) RequireRole(allowedRoles ...string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			user := UserFromContext(r.Context())
+			if user == nil {
+				middleware.JSONError(w, http.StatusUnauthorized, "authentication required")
+				return
+			}
+			// Admin bypasses all role checks
+			if user.Role == "admin" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			for _, role := range allowedRoles {
+				if user.Role == role {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+			middleware.JSONError(w, http.StatusForbidden, "insufficient permissions")
+		})
+	}
 }
 
 // APIKeyMiddleware validates an API key from X-API-Key header or Authorization: Bearer rfk_...

@@ -34,6 +34,7 @@ func NewHandler(s *store.Store, a *auth.AuthService, secretsKey string) *Handler
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	// Public routes (no auth)
 	mux.HandleFunc("GET /health", h.health)
+	mux.HandleFunc("POST /api/auth/login", h.adminLogin)
 	mux.HandleFunc("POST /api/auth/oidc/start", h.oidcStart)
 	mux.HandleFunc("POST /api/auth/oidc/callback", h.oidcCallback)
 
@@ -66,11 +67,23 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 
 	adminMux.HandleFunc("GET /api/audit", h.listAuditEntries)
 
+	// Organizations
+	adminMux.HandleFunc("GET /api/organizations", h.listOrgs)
+	adminMux.HandleFunc("POST /api/organizations", h.createOrg)
+	adminMux.HandleFunc("DELETE /api/organizations/{id}", h.deleteOrg)
+	adminMux.HandleFunc("GET /api/organizations/{id}/members", h.listOrgMembers)
+	adminMux.HandleFunc("POST /api/organizations/{id}/members", h.addOrgMember)
+	adminMux.HandleFunc("PUT /api/organizations/members/{memberId}", h.updateOrgMemberRole)
+	adminMux.HandleFunc("DELETE /api/organizations/members/{memberId}", h.removeOrgMember)
+
+	// Secrets
 	adminMux.HandleFunc("GET /api/secrets", h.listSecrets)
 	adminMux.HandleFunc("POST /api/secrets", h.createSecret)
 	adminMux.HandleFunc("GET /api/secrets/{id}", h.getSecret)
 	adminMux.HandleFunc("PUT /api/secrets/{id}", h.updateSecret)
 	adminMux.HandleFunc("DELETE /api/secrets/{id}", h.deleteSecret)
+
+	// All admin routes require JWT
 	mux.Handle("/api/", h.auth.JWTMiddleware(adminMux))
 
 	// Secrets resolve endpoint (API key only — for programmatic access)
@@ -462,6 +475,174 @@ func (h *Handler) listAuditEntries(w http.ResponseWriter, r *http.Request) {
 		entries = []models.AuditLogEntry{}
 	}
 	middleware.JSONResponse(w, http.StatusOK, entries)
+}
+
+// --- Admin Login (hardcoded credentials) ---
+
+func (h *Handler) adminLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		middleware.JSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	user, token, err := h.auth.LoginAdmin(req.Email, req.Password)
+	if err != nil {
+		middleware.JSONError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	h.audit(user.Email, "LOGIN", "user", user.ID, "admin login")
+	middleware.JSONResponse(w, http.StatusOK, map[string]any{
+		"token": token,
+		"user":  user,
+	})
+}
+
+// --- Organizations ---
+
+func (h *Handler) listOrgs(w http.ResponseWriter, r *http.Request) {
+	orgs, err := h.store.ListOrgs()
+	if err != nil {
+		middleware.JSONError(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	if orgs == nil {
+		orgs = []models.Organization{}
+	}
+	middleware.JSONResponse(w, http.StatusOK, orgs)
+}
+
+func (h *Handler) createOrg(w http.ResponseWriter, r *http.Request) {
+	var org models.Organization
+	if err := json.NewDecoder(r.Body).Decode(&org); err != nil {
+		middleware.JSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if org.Name == "" || org.Slug == "" {
+		middleware.JSONError(w, http.StatusBadRequest, "name and slug are required")
+		return
+	}
+	org.ID = uuid.New().String()
+	if err := h.store.CreateOrg(&org); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			middleware.JSONError(w, http.StatusConflict, "slug already exists")
+			return
+		}
+		middleware.JSONError(w, http.StatusInternalServerError, "failed to create org")
+		return
+	}
+	// Make the creator an owner (if they exist in the users table)
+	user := auth.UserFromContext(r.Context())
+	if user != nil && user.ID != "admin" {
+		member := &models.OrgMember{
+			ID:     uuid.New().String(),
+			UserID: user.ID,
+			OrgID:  org.ID,
+			Role:   "owner",
+		}
+		_ = h.store.AddOrgMember(member)
+	}
+	h.audit(auth.ActorFromContext(r.Context()), "CREATE", "organization", org.ID, org.Name)
+	middleware.JSONResponse(w, http.StatusCreated, org)
+}
+
+func (h *Handler) deleteOrg(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := h.store.DeleteOrg(id); err != nil {
+		middleware.JSONError(w, http.StatusInternalServerError, "failed to delete org")
+		return
+	}
+	h.audit(auth.ActorFromContext(r.Context()), "DELETE", "organization", id, "")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) listOrgMembers(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("id")
+	members, err := h.store.ListOrgMembers(orgID)
+	if err != nil {
+		middleware.JSONError(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	if members == nil {
+		members = []models.OrgMember{}
+	}
+	middleware.JSONResponse(w, http.StatusOK, members)
+}
+
+func (h *Handler) addOrgMember(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("id")
+	var req struct {
+		Email string `json:"email"`
+		Role  string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		middleware.JSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Email == "" {
+		middleware.JSONError(w, http.StatusBadRequest, "email is required")
+		return
+	}
+	if req.Role == "" {
+		req.Role = "member"
+	}
+	// Find user by email
+	user, err := h.store.GetUserByEmail(req.Email)
+	if err != nil || user == nil {
+		middleware.JSONError(w, http.StatusNotFound, "user not found — they must log in via OIDC first")
+		return
+	}
+	member := &models.OrgMember{
+		ID:     uuid.New().String(),
+		UserID: user.ID,
+		OrgID:  orgID,
+		Role:   req.Role,
+	}
+	if err := h.store.AddOrgMember(member); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			middleware.JSONError(w, http.StatusConflict, "user already a member")
+			return
+		}
+		middleware.JSONError(w, http.StatusInternalServerError, "failed to add member")
+		return
+	}
+	h.audit(auth.ActorFromContext(r.Context()), "ADD_MEMBER", "organization", orgID, req.Email)
+	member.UserName = user.Name
+	member.UserEmail = user.Email
+	middleware.JSONResponse(w, http.StatusCreated, member)
+}
+
+func (h *Handler) updateOrgMemberRole(w http.ResponseWriter, r *http.Request) {
+	memberID := r.PathValue("memberId")
+	var req struct {
+		Role string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		middleware.JSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Role == "" {
+		middleware.JSONError(w, http.StatusBadRequest, "role is required")
+		return
+	}
+	if err := h.store.UpdateOrgMemberRole(memberID, req.Role); err != nil {
+		middleware.JSONError(w, http.StatusInternalServerError, "failed to update role")
+		return
+	}
+	h.audit(auth.ActorFromContext(r.Context()), "UPDATE_ROLE", "org_member", memberID, req.Role)
+	middleware.JSONResponse(w, http.StatusOK, map[string]string{"status": "updated", "role": req.Role})
+}
+
+func (h *Handler) removeOrgMember(w http.ResponseWriter, r *http.Request) {
+	memberID := r.PathValue("memberId")
+	if err := h.store.RemoveOrgMember(memberID); err != nil {
+		middleware.JSONError(w, http.StatusInternalServerError, "failed to remove member")
+		return
+	}
+	h.audit(auth.ActorFromContext(r.Context()), "REMOVE_MEMBER", "org_member", memberID, "")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- Helpers ---

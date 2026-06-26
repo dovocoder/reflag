@@ -107,6 +107,22 @@ func (s *Store) migrate() error {
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
+		`CREATE TABLE IF NOT EXISTS organizations (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			slug TEXT UNIQUE NOT NULL,
+			description TEXT DEFAULT '',
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS org_members (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+			role TEXT NOT NULL DEFAULT 'member',
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(user_id, org_id)
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_flags_key ON flags(key)`,
 		`CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp DESC)`,
@@ -552,4 +568,101 @@ func (s *Store) UpdateSecret(secret *models.Secret) error {
 func (s *Store) DeleteSecret(id string) error {
 	_, err := s.db.Exec(`DELETE FROM secrets WHERE id = ?`, id)
 	return err
+}
+
+// --- Organizations ---
+
+func (s *Store) CreateOrg(org *models.Organization) error {
+	_, err := s.db.Exec(`INSERT INTO organizations (id, name, slug, description) VALUES (?, ?, ?, ?)`,
+		org.ID, org.Name, org.Slug, org.Description)
+	return err
+}
+
+func (s *Store) ListOrgs() ([]models.Organization, error) {
+	rows, err := s.db.Query(`SELECT id, name, slug, description, created_at, updated_at FROM organizations ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var orgs []models.Organization
+	for rows.Next() {
+		var o models.Organization
+		if err := rows.Scan(&o.ID, &o.Name, &o.Slug, &o.Description, &o.CreatedAt, &o.UpdatedAt); err != nil {
+			return nil, err
+		}
+		orgs = append(orgs, o)
+	}
+	return orgs, nil
+}
+
+func (s *Store) GetOrg(id string) (*models.Organization, error) {
+	var o models.Organization
+	err := s.db.QueryRow(`SELECT id, name, slug, description, created_at, updated_at FROM organizations WHERE id = ?`, id).
+		Scan(&o.ID, &o.Name, &o.Slug, &o.Description, &o.CreatedAt, &o.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &o, err
+}
+
+func (s *Store) DeleteOrg(id string) error {
+	_, err := s.db.Exec(`DELETE FROM organizations WHERE id = ?`, id)
+	return err
+}
+
+// --- Org Members ---
+
+func (s *Store) AddOrgMember(member *models.OrgMember) error {
+	_, err := s.db.Exec(`INSERT INTO org_members (id, user_id, org_id, role) VALUES (?, ?, ?, ?)`,
+		member.ID, member.UserID, member.OrgID, member.Role)
+	return err
+}
+
+func (s *Store) ListOrgMembers(orgID string) ([]models.OrgMember, error) {
+	rows, err := s.db.Query(`SELECT om.id, om.user_id, om.org_id, om.role, om.created_at, u.name, u.email
+		FROM org_members om JOIN users u ON u.id = om.user_id WHERE om.org_id = ? ORDER BY om.created_at`, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var members []models.OrgMember
+	for rows.Next() {
+		var m models.OrgMember
+		if err := rows.Scan(&m.ID, &m.UserID, &m.OrgID, &m.Role, &m.CreatedAt, &m.UserName, &m.UserEmail); err != nil {
+			return nil, err
+		}
+		members = append(members, m)
+	}
+	return members, nil
+}
+
+func (s *Store) UpdateOrgMemberRole(memberID, role string) error {
+	_, err := s.db.Exec(`UPDATE org_members SET role = ? WHERE id = ?`, role, memberID)
+	return err
+}
+
+func (s *Store) RemoveOrgMember(memberID string) error {
+	_, err := s.db.Exec(`DELETE FROM org_members WHERE id = ?`, memberID)
+	return err
+}
+
+func (s *Store) GetUserOrgRole(userID, orgID string) (string, error) {
+	var role string
+	err := s.db.QueryRow(`SELECT role FROM org_members WHERE user_id = ? AND org_id = ?`, userID, orgID).Scan(&role)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return role, err
+}
+
+func (s *Store) GetUserByEmail(email string) (*models.User, error) {
+	var u models.User
+	err := s.db.QueryRow(`SELECT id, email, name FROM users WHERE email = ?`, email).Scan(&u.ID, &u.Email, &u.Name)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
 }
