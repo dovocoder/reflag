@@ -31,12 +31,13 @@ func NewHandler(s *store.Store, a *auth.AuthService, secretsKey string) *Handler
 }
 
 // RegisterRoutes sets up all API routes on the given mux.
-func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+func (h *Handler) RegisterRoutes(mux *http.ServeMux, loginLimiter *middleware.RateLimiter) {
 	// Public routes (no auth)
 	mux.HandleFunc("GET /health", h.health)
-	mux.HandleFunc("POST /api/auth/login", h.adminLogin)
+	// Login and OIDC callback have stricter rate limiting
+	mux.Handle("POST /api/auth/login", middleware.RateLimitMiddleware(loginLimiter, http.HandlerFunc(h.adminLogin)))
 	mux.HandleFunc("POST /api/auth/oidc/start", h.oidcStart)
-	mux.HandleFunc("POST /api/auth/oidc/callback", h.oidcCallback)
+	mux.Handle("POST /api/auth/oidc/callback", middleware.RateLimitMiddleware(loginLimiter, http.HandlerFunc(h.oidcCallback)))
 
 	// Evaluation routes (API key or JWT) — OpenFeature HTTP API
 	evalMux := http.NewServeMux()
@@ -112,7 +113,7 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 // --- OIDC Auth ---
 
 func (h *Handler) oidcStart(w http.ResponseWriter, r *http.Request) {
-	state, err := auth.GenerateState()
+	state, err := h.auth.GenerateState()
 	if err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to generate state")
 		return
@@ -122,6 +123,16 @@ func (h *Handler) oidcStart(w http.ResponseWriter, r *http.Request) {
 		middleware.JSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Set SameSite=Lax cookie for state validation
+	http.SetCookie(w, &http.Cookie{
+		Name:     "reflag_oidc_state",
+		Value:     state,
+		Path:     "/",
+		MaxAge:   600, // 10 minutes
+		HttpOnly:  true,
+		SameSite:  http.SameSiteLaxMode,
+		Secure:    r.TLS != nil,
+	})
 	middleware.JSONResponse(w, http.StatusOK, map[string]string{
 		"authorization_url": authURL,
 		"state":            state,
@@ -130,18 +141,42 @@ func (h *Handler) oidcStart(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) oidcCallback(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Code string `json:"code"`
+		Code  string `json:"code"`
+		State string `json:"state"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		middleware.JSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	// Validate state to prevent CSRF/OAuth code injection
+	if req.State == "" {
+		middleware.JSONError(w, http.StatusBadRequest, "state is required")
+		return
+	}
+	cookieState, err := r.Cookie("reflag_oidc_state")
+	if err != nil || cookieState.Value == "" {
+		middleware.JSONError(w, http.StatusBadRequest, "missing state cookie")
+		return
+	}
+	if !h.auth.ValidateState(req.State) || req.State != cookieState.Value {
+		h.audit("unknown", "LOGIN_FAILED", "user", "", "invalid OIDC state")
+		middleware.JSONError(w, http.StatusForbidden, "invalid state")
+		return
+	}
+	// Clear the state cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:   "reflag_oidc_state",
+		Value:  "",
+		Path:   "/",
+		MaxAge: -1,
+	})
 	user, token, err := h.auth.ExchangeCode(req.Code)
 	if err != nil {
+		h.audit("unknown", "LOGIN_FAILED", "user", "", "OIDC exchange failed")
 		middleware.JSONError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-	h.audit(auth.ActorFromContext(r.Context()), "LOGIN", "user", user.ID, "")
+	h.audit(user.Email, "LOGIN", "user", user.ID, "OIDC login")
 	middleware.JSONResponse(w, http.StatusOK, map[string]any{
 		"token": token,
 		"user":  user,
@@ -298,17 +333,17 @@ func (h *Handler) listFlagsForClient(w http.ResponseWriter, r *http.Request) {
 		middleware.JSONError(w, http.StatusInternalServerError, "database error")
 		return
 	}
-	// Return minimal data for client SDKs
+	// Return minimal data for client SDKs — strip secret reference values
+	// to prevent leaking secret key names to API consumers
 	type clientFlag struct {
-		Key      string          `json:"key"`
-		Enabled  bool            `json:"enabled"`
-		Type     string          `json:"type"`
-		Variations []models.Variation `json:"variations"`
+		Key        string `json:"key"`
+		Enabled    bool   `json:"enabled"`
+		Type       string `json:"type"`
 	}
 	result := make([]clientFlag, 0, len(flags))
 	for _, f := range flags {
 		result = append(result, clientFlag{
-			Key: f.Key, Enabled: f.Enabled, Type: string(f.Type), Variations: f.Variations,
+			Key: f.Key, Enabled: f.Enabled, Type: string(f.Type),
 		})
 	}
 	middleware.JSONResponse(w, http.StatusOK, result)
@@ -586,6 +621,7 @@ func (h *Handler) adminLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	user, token, err := h.auth.LoginAdmin(req.Email, req.Password)
 	if err != nil {
+		h.audit(req.Email, "LOGIN_FAILED", "user", "admin", "invalid credentials")
 		middleware.JSONError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
@@ -1005,13 +1041,20 @@ func (h *Handler) resolveSecret(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) resolveAllSecrets(w http.ResponseWriter, r *http.Request) {
+	apiKey := auth.APIKeyFromContext(r.Context())
 	secrets, err := h.store.ListSecrets()
 	if err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "database error")
 		return
 	}
-	result := make(map[string]string, len(secrets))
+	result := make(map[string]string)
 	for _, s := range secrets {
+		// Scope secrets by API key's environment ID if set
+		if apiKey != nil && apiKey.EnvironmentID != "" {
+			if s.EnvironmentID != apiKey.EnvironmentID {
+				continue
+			}
+		}
 		decrypted, err := crypto.Decrypt(s.EncryptedValue, h.secretsKey)
 		if err != nil {
 			continue

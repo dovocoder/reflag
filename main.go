@@ -42,16 +42,22 @@ func main() {
 
 	// Initialize auth service
 	authSvc := auth.New(st, cfg.JWTSecret, cfg.OIDCIssuer, cfg.OIDCClientID, cfg.OIDCClientSec, cfg.OIDCRedirect)
-	authSvc.SetAdminCredentials(cfg.AdminEmail, cfg.AdminPassword)
+	if err := authSvc.SetAdminCredentials(cfg.AdminEmail, cfg.AdminPassword); err != nil {
+		log.Fatalf("Failed to set admin credentials: %v", err)
+	}
 
 	// Initialize API handlers
 	handler := api.NewHandler(st, authSvc, cfg.SecretsKey)
 
+	// Rate limiters
+	rateLimiter := middleware.NewRateLimiter(100, time.Minute)
+	loginRateLimiter := middleware.NewRateLimiter(10, time.Minute) // 10 login attempts per minute
+
 	// Main mux
 	mux := http.NewServeMux()
 
-	// Register API routes
-	handler.RegisterRoutes(mux)
+	// Register API routes (with login rate limiter)
+	handler.RegisterRoutes(mux, loginRateLimiter)
 
 	// Serve embedded frontend (SPA with fallback)
 	distFS, err := fs.Sub(webFS, "web/dist")
@@ -71,8 +77,6 @@ func main() {
 	})
 
 	// Build middleware chain: security headers → CORS → rate limit → CSRF → mux
-	rateLimiter := middleware.NewRateLimiter(100, time.Minute)
-
 	var finalHandler http.Handler = mux
 	finalHandler = middleware.MaxBodyMiddleware(finalHandler)
 	finalHandler = middleware.CSRFMiddleware(finalHandler)

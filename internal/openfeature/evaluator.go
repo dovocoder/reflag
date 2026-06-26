@@ -367,6 +367,9 @@ func matchesCondition(cond models.Condition, ctx EvaluationContext) bool {
 		return attrStr != ""
 	case "regex", "REGEX":
 		for _, v := range cond.Values {
+			if len(v) > 500 {
+				continue // reject overly long patterns
+			}
 			re, err := regexp.Compile(v)
 			if err == nil && re.MatchString(attrStr) {
 				return true

@@ -1,9 +1,11 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
-	"strings"
 )
 
 // Config holds all application configuration values.
@@ -34,21 +36,20 @@ func Load() (*Config, error) {
 	if dbPath == "" {
 		dbPath = "reflag.db"
 	}
-	// Generate a warning if JWT_SECRET is not set in production
+	isProd := os.Getenv("APP_ENV") == "production"
+	// Generate a random JWT secret in dev mode if not set
 	jwtSecret := os.Getenv("JWT_SECRET")
 	if jwtSecret == "" {
-		// In dev, use a fixed but clearly insecure secret
-		jwtSecret = "dev-only-not-secure-change-me-in-production"
-	}
-	isProd := strings.ToLower(os.Getenv("APP_ENV")) == "production"
-	// In production, refuse to start with insecure secrets
-	if isProd {
-		if len(jwtSecret) < 32 {
-			return nil, fmt.Errorf("JWT_SECRET must be at least 32 characters in production (got %d)", len(jwtSecret))
+		if isProd {
+			return nil, fmt.Errorf("JWT_SECRET must be set in production")
 		}
-		if jwtSecret == "dev-only-not-secure-change-me-in-production" {
-			return nil, fmt.Errorf("JWT_SECRET must be set to a secure value in production")
+		// Dev mode: generate a random per-session secret
+		b := make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			return nil, fmt.Errorf("failed to generate dev JWT secret: %w", err)
 		}
+		jwtSecret = "dev:" + hex.EncodeToString(b)
+		log.Printf("[reflag] Warning: JWT_SECRET not set — generated random dev secret")
 	}
 	// Secrets encryption key — use SECRETS_KEY if set, otherwise derive from JWT_SECRET
 	secretsKey := os.Getenv("SECRETS_KEY")

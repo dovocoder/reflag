@@ -4,9 +4,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/dovocoder/reflag/internal/models"
+	"github.com/google/uuid"
 
 	_ "modernc.org/sqlite"
 )
@@ -134,8 +134,27 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migration step: %w", err)
 		}
 	}
-	// Add version column if upgrading from older schema
-	s.db.Exec(`ALTER TABLE flags ADD COLUMN version INTEGER NOT NULL DEFAULT 1`)
+	// Add version column if upgrading from older schema (check first)
+	hasVersion := false
+	rows, err := s.db.Query("PRAGMA table_info(flags)")
+	if err == nil {
+		for rows.Next() {
+			var cid int
+			var name, ctype string
+			var notnull, pk int
+			var dflt sql.NullString
+			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
+				if name == "version" {
+					hasVersion = true
+					break
+				}
+			}
+		}
+		rows.Close()
+	}
+	if !hasVersion {
+		s.db.Exec(`ALTER TABLE flags ADD COLUMN version INTEGER NOT NULL DEFAULT 1`)
+	}
 	return nil
 }
 
@@ -479,7 +498,7 @@ func (s *Store) GetOrCreateUser(email, name string) (*models.User, error) {
 
 type flagData struct {
 	Variations   []models.Variation     `json:"variations"`
-	Targeting    []models.TargetingRule `json:"targeting"`
+	Targeting    []models.TargetingRule `json:"targeting_rules"`
 	DefaultRule  *models.DefaultRule     `json:"default_rule,omitempty"`
 }
 
@@ -516,7 +535,7 @@ func boolToInt(b bool) int {
 }
 
 func generateID() string {
-	return fmt.Sprintf("%d", time.Now().UnixNano())
+	return uuid.New().String()
 }
 
 // --- Secrets ---

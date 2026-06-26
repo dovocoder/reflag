@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -19,6 +20,7 @@ import (
 	"github.com/dovocoder/reflag/internal/models"
 	"github.com/dovocoder/reflag/internal/store"
 	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/crypto/bcrypt"
 )
 
 const (
@@ -38,8 +40,8 @@ type AuthService struct {
 	oidcRedirect  string
 
 	// Hardcoded admin credentials
-	adminEmail    string
-	adminPassword string
+	adminEmail      string
+	adminPassHash   []byte // bcrypt hash
 
 	// OIDC discovery cache
 	mu            sync.Mutex
@@ -80,9 +82,18 @@ func New(s *store.Store, jwtSecret, oidcIssuer, oidcClientID, oidcClientSec, oid
 }
 
 // SetAdminCredentials configures the hardcoded admin account.
-func (a *AuthService) SetAdminCredentials(email, password string) {
+// The password is hashed with bcrypt at startup — plaintext is never retained.
+func (a *AuthService) SetAdminCredentials(email, password string) error {
+	if password == "" {
+		return fmt.Errorf("admin password is required")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("failed to hash admin password: %w", err)
+	}
 	a.adminEmail = email
-	a.adminPassword = password
+	a.adminPassHash = hash
+	return nil
 }
 
 // --- JWT ---
@@ -101,6 +112,7 @@ func (a *AuthService) GenerateJWT(user *models.User) (string, error) {
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			Issuer:    "reflag",
+			Audience:  []string{"reflag"},
 		},
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -109,13 +121,18 @@ func (a *AuthService) GenerateJWT(user *models.User) (string, error) {
 
 // LoginAdmin checks hardcoded admin credentials and returns a JWT.
 func (a *AuthService) LoginAdmin(email, password string) (*models.User, string, error) {
-	if a.adminEmail == "" || a.adminPassword == "" {
+	if a.adminEmail == "" || len(a.adminPassHash) == 0 {
 		return nil, "", fmt.Errorf("admin login not configured")
 	}
-	// Constant-time comparison to prevent timing attacks
+	// Constant-time email comparison
 	emailMatch := subtle.ConstantTimeCompare([]byte(email), []byte(a.adminEmail)) == 1
-	passwordMatch := subtle.ConstantTimeCompare([]byte(password), []byte(a.adminPassword)) == 1
-	if !emailMatch || !passwordMatch {
+	if !emailMatch {
+		// Still run bcrypt to prevent timing attacks
+		_ = bcrypt.CompareHashAndPassword(a.adminPassHash, []byte(password))
+		return nil, "", fmt.Errorf("invalid credentials")
+	}
+	// bcrypt comparison (constant-time internally)
+	if err := bcrypt.CompareHashAndPassword(a.adminPassHash, []byte(password)); err != nil {
 		return nil, "", fmt.Errorf("invalid credentials")
 	}
 	user := &models.User{
@@ -137,7 +154,7 @@ func (a *AuthService) ValidateJWT(tokenStr string) (*Claims, error) {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return []byte(a.jwtSecret), nil
-	})
+	}, jwt.WithIssuer("reflag"), jwt.WithAudience("reflag"))
 	if err != nil {
 		return nil, err
 	}
@@ -185,6 +202,37 @@ func (a *AuthService) ValidateAPIKey(key string) (*models.APIKey, error) {
 	return apiKey, nil
 }
 
+// HasScope checks if the API key has a specific scope.
+// Empty scopes means all access (backward compatibility).
+func HasScope(ctx context.Context, scope string) bool {
+	apiKey := APIKeyFromContext(ctx)
+	if apiKey == nil {
+		return false
+	}
+	if len(apiKey.Scopes) == 0 {
+		return true // no scope restriction
+	}
+	for _, s := range apiKey.Scopes {
+		if s == scope || s == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+// RequireScope is middleware that checks the API key has the required scope.
+func (a *AuthService) RequireScope(scope string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !HasScope(r.Context(), scope) {
+				middleware.JSONError(w, http.StatusForbidden, fmt.Sprintf("API key missing required scope: %s", scope))
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // --- OIDC ---
 
 func (a *AuthService) GetDiscovery() (*OIDCDiscovery, error) {
@@ -208,7 +256,7 @@ func (a *AuthService) GetDiscovery() (*OIDCDiscovery, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("OIDC discovery returned %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB max
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +265,7 @@ func (a *AuthService) GetDiscovery() (*OIDCDiscovery, error) {
 		return nil, err
 	}
 	a.discovery = &d
-	a.discoveryExpiry = time.Now().Add(1 * time.Hour)
+	a.discoveryExpiry = time.Now().Add(15 * time.Minute)
 	return &d, nil
 }
 
@@ -254,7 +302,7 @@ func (a *AuthService) ExchangeCode(code string) (*models.User, string, error) {
 		return nil, "", fmt.Errorf("token exchange failed: %w", err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB max
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("token exchange returned %d: %s", resp.StatusCode, string(body))
 	}
@@ -275,7 +323,7 @@ func (a *AuthService) ExchangeCode(code string) (*models.User, string, error) {
 		return nil, "", fmt.Errorf("userinfo fetch failed: %w", err)
 	}
 	defer resp2.Body.Close()
-	body2, _ := io.ReadAll(resp2.Body)
+	body2, _ := io.ReadAll(io.LimitReader(resp2.Body, 1<<20)) // 1MB max
 	if resp2.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("userinfo returned %d", resp2.StatusCode)
 	}
@@ -436,11 +484,32 @@ func (a *AuthService) AnyAuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// GenerateState generates a random OIDC state token.
-func GenerateState() (string, error) {
+// ValidateState verifies an OIDC state token using HMAC-SHA256.
+// State = random_hex + "." + HMAC(random_hex, jwtSecret)
+// This prevents CSRF in the OIDC flow without server-side session storage.
+func (a *AuthService) ValidateState(state string) bool {
+	parts := strings.SplitN(state, ".", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	nonce, sig := parts[0], parts[1]
+	expectedSig := a.signState(nonce)
+	return subtle.ConstantTimeCompare([]byte(sig), []byte(expectedSig)) == 1
+}
+
+func (a *AuthService) signState(nonce string) string {
+	h := hmac.New(sha256.New, []byte(a.jwtSecret))
+	h.Write([]byte("oidc-state:"))
+	h.Write([]byte(nonce))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// GenerateState generates a random OIDC state token with HMAC signature.
+func (a *AuthService) GenerateState() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(b), nil
+	nonce := hex.EncodeToString(b)
+	return nonce + "." + a.signState(nonce), nil
 }

@@ -3,6 +3,7 @@ package middleware
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -34,7 +35,7 @@ func init() {
 }
 
 // isOriginAllowed checks if the given origin is in the allowed set.
-// In development (no CORS_ORIGINS configured), allows same-origin via localhost.
+// In development (no CORS_ORIGINS configured AND not production), allows localhost.
 func isOriginAllowed(origin string) bool {
 	if origin == "" {
 		return false
@@ -43,11 +44,13 @@ func isOriginAllowed(origin string) bool {
 	if ok {
 		return true
 	}
-	// Dev fallback: allow localhost origins if no CORS_ORIGINS configured
-	_, hasConfig := allowedOrigins.Load("__configured__")
-	if !hasConfig {
-		if strings.HasPrefix(origin, "http://localhost") || strings.HasPrefix(origin, "http://127.0.0.1") {
-			return true
+	// Dev fallback: allow localhost origins only when not in production
+	if os.Getenv("APP_ENV") != "production" {
+		_, hasConfig := allowedOrigins.Load("__configured__")
+		if !hasConfig {
+			if strings.HasPrefix(origin, "http://localhost") || strings.HasPrefix(origin, "http://127.0.0.1") {
+				return true
+			}
 		}
 	}
 	return false
@@ -151,6 +154,22 @@ func (rl *RateLimiter) Stop() {
 func (rl *RateLimiter) Allow(ip string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
+
+	// Cap the number of tracked IPs to prevent memory exhaustion
+	const maxIPs = 100000
+	if len(rl.store) >= maxIPs {
+		// Evict oldest entries
+		now := time.Now()
+		for ip, bucket := range rl.store {
+			if now.Sub(bucket.windowStart) > rl.window {
+				delete(rl.store, ip)
+			}
+		}
+		// If still too many, clear all (DoS mitigation)
+		if len(rl.store) >= maxIPs {
+			rl.store = make(map[string]*rateBucket)
+		}
+	}
 
 	now := time.Now()
 	bucket, exists := rl.store[ip]
@@ -273,15 +292,12 @@ func CSRFMiddleware(next http.Handler) http.Handler {
 }
 
 func isSameOrigin(origin string, r *http.Request) bool {
-	// Parse origin URL and compare host with request host
-	host := r.Host
-	if strings.HasPrefix(origin, "https://") {
-		return strings.TrimPrefix(origin, "https://") == host
+	// Parse origin URL and compare only host (ignoring path/trailing slash)
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
 	}
-	if strings.HasPrefix(origin, "http://") {
-		return strings.TrimPrefix(origin, "http://") == host
-	}
-	return false
+	return u.Host == r.Host
 }
 
 // MaxBodySize limits the size of request bodies to prevent DoS.
