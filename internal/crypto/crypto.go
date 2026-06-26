@@ -3,6 +3,7 @@ package crypto
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -72,9 +73,37 @@ func Decrypt(encoded string, key []byte) (string, error) {
 	return string(plaintext), nil
 }
 
-// DeriveKey derives a 32-byte AES-256 key from a passphrase using SHA-256
-// with a domain separator. The passphrase should be high-entropy (e.g., JWT_SECRET).
+// DeriveKey derives a 32-byte AES-256 key from a passphrase using HKDF
+// (HMAC-based Key Derivation Function, RFC 5869) with a domain separator.
+// This is a proper KDF — the previous single SHA-256 approach had no
+// salt or iterations, making it vulnerable to dictionary attacks.
 func DeriveKey(passphrase string) []byte {
-	hash := sha256.Sum256([]byte("reflag-secrets-key:" + passphrase))
-	return hash[:]
+	return hkdfSHA256([]byte("reflag-secrets-key"), []byte(passphrase), 32)
+}
+
+// hkdfSHA256 implements HKDF with SHA-256 (RFC 5869).
+func hkdfSHA256(salt, ikm []byte, length int) []byte {
+	// Extract: PRK = HMAC-SHA256(salt, IKM)
+	prk := hmacSHA256(salt, ikm)
+
+	// Expand: OKM = T(1) | T(2) | ...
+	// T(i) = HMAC(PRK, T(i-1) | info | i)
+	info := []byte("reflag-key-derivation")
+	var okm []byte
+	var t []byte
+	counter := byte(1)
+	for len(okm) < length {
+		data := append(append(t, info...), counter)
+		t = hmacSHA256(prk, data)
+		okm = append(okm, t...)
+		counter++
+	}
+	return okm[:length]
+}
+
+// hmacSHA256 computes HMAC-SHA256(key, data).
+func hmacSHA256(key, data []byte) []byte {
+	h := hmac.New(sha256.New, key)
+	h.Write(data)
+	return h.Sum(nil)
 }

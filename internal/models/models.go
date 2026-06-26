@@ -13,6 +13,7 @@ const (
 	FlagTypeString  FlagType = "string"
 	FlagTypeNumber  FlagType = "number"
 	FlagTypeObject  FlagType = "object"
+	FlagTypeSecret  FlagType = "secret"
 )
 
 // FlagState represents whether a flag is on or off.
@@ -41,6 +42,7 @@ type Flag struct {
 	Description string            `json:"description"`
 	Type        FlagType          `json:"type"`
 	Enabled     bool              `json:"enabled"`
+	Version     int               `json:"version"`
 	Variations  []Variation       `json:"variations"`
 	Targeting   []TargetingRule   `json:"targeting_rules"`
 	DefaultRule *DefaultRule      `json:"default_rule,omitempty"`

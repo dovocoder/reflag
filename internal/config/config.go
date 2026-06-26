@@ -24,7 +24,8 @@ type Config struct {
 }
 
 // Load reads configuration from environment variables with sensible defaults.
-func Load() *Config {
+// Returns nil and an error if required configuration is missing in production.
+func Load() (*Config, error) {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -40,8 +41,14 @@ func Load() *Config {
 		jwtSecret = "dev-only-not-secure-change-me-in-production"
 	}
 	isProd := strings.ToLower(os.Getenv("APP_ENV")) == "production"
-	if isProd && len(jwtSecret) < 32 {
-		fmt.Fprintln(os.Stderr, "[reflag] WARNING: JWT_SECRET must be at least 32 characters in production")
+	// In production, refuse to start with insecure secrets
+	if isProd {
+		if len(jwtSecret) < 32 {
+			return nil, fmt.Errorf("JWT_SECRET must be at least 32 characters in production (got %d)", len(jwtSecret))
+		}
+		if jwtSecret == "dev-only-not-secure-change-me-in-production" {
+			return nil, fmt.Errorf("JWT_SECRET must be set to a secure value in production")
+		}
 	}
 	// Secrets encryption key — use SECRETS_KEY if set, otherwise derive from JWT_SECRET
 	secretsKey := os.Getenv("SECRETS_KEY")
@@ -49,7 +56,7 @@ func Load() *Config {
 		secretsKey = jwtSecret
 	}
 	if isProd && len(secretsKey) < 32 {
-		fmt.Fprintln(os.Stderr, "[reflag] WARNING: SECRETS_KEY or JWT_SECRET must be at least 32 characters for secrets encryption")
+		return nil, fmt.Errorf("SECRETS_KEY or JWT_SECRET must be at least 32 characters for secrets encryption in production")
 	}
 	return &Config{
 		Port:          port,
@@ -63,5 +70,5 @@ func Load() *Config {
 		AdminEmail:    os.Getenv("ADMIN_EMAIL"),
 		AdminPassword: os.Getenv("ADMIN_PASSWORD"),
 		IsProduction:  isProd,
-	}
+	}, nil
 }

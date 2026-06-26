@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -44,6 +45,9 @@ type AuthService struct {
 	mu            sync.Mutex
 	discovery     *OIDCDiscovery
 	discoveryExpiry time.Time
+
+	// HTTP client with timeout for OIDC requests
+	httpClient *http.Client
 }
 
 type OIDCDiscovery struct {
@@ -69,6 +73,9 @@ func New(s *store.Store, jwtSecret, oidcIssuer, oidcClientID, oidcClientSec, oid
 		oidcClientID:  oidcClientID,
 		oidcClientSec: oidcClientSec,
 		oidcRedirect:  oidcRedirect,
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+		},
 	}
 }
 
@@ -105,7 +112,10 @@ func (a *AuthService) LoginAdmin(email, password string) (*models.User, string, 
 	if a.adminEmail == "" || a.adminPassword == "" {
 		return nil, "", fmt.Errorf("admin login not configured")
 	}
-	if email != a.adminEmail || password != a.adminPassword {
+	// Constant-time comparison to prevent timing attacks
+	emailMatch := subtle.ConstantTimeCompare([]byte(email), []byte(a.adminEmail)) == 1
+	passwordMatch := subtle.ConstantTimeCompare([]byte(password), []byte(a.adminPassword)) == 1
+	if !emailMatch || !passwordMatch {
 		return nil, "", fmt.Errorf("invalid credentials")
 	}
 	user := &models.User{
@@ -190,7 +200,7 @@ func (a *AuthService) GetDiscovery() (*OIDCDiscovery, error) {
 	}
 
 	discoveryURL := strings.TrimSuffix(a.oidcIssuer, "/") + "/.well-known/openid-configuration"
-	resp, err := http.Get(discoveryURL)
+	resp, err := a.httpClient.Get(discoveryURL)
 	if err != nil {
 		return nil, fmt.Errorf("OIDC discovery failed: %w", err)
 	}
@@ -239,7 +249,7 @@ func (a *AuthService) ExchangeCode(code string) (*models.User, string, error) {
 		"client_id":     {a.oidcClientID},
 		"client_secret": {a.oidcClientSec},
 	}
-	resp, err := http.PostForm(d.TokenEndpoint, data)
+	resp, err := a.httpClient.PostForm(d.TokenEndpoint, data)
 	if err != nil {
 		return nil, "", fmt.Errorf("token exchange failed: %w", err)
 	}
@@ -260,7 +270,7 @@ func (a *AuthService) ExchangeCode(code string) (*models.User, string, error) {
 	// Fetch userinfo
 	req, _ := http.NewRequest("GET", d.UserinfoEndpoint, nil)
 	req.Header.Set("Authorization", "Bearer "+tokenResp.AccessToken)
-	resp2, err := http.DefaultClient.Do(req)
+	resp2, err := a.httpClient.Do(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("userinfo fetch failed: %w", err)
 	}
@@ -297,9 +307,10 @@ func (a *AuthService) ExchangeCode(code string) (*models.User, string, error) {
 type contextKey string
 
 const (
-	userKey   contextKey = "user"
-	apiKeyKey contextKey = "apiKey"
-	actorKey  contextKey = "actor"
+	userKey      contextKey = "user"
+	apiKeyKey    contextKey = "apiKey"
+	rawAPIKeyKey contextKey = "rawAPIKey"
+	actorKey     contextKey = "actor"
 )
 
 func UserFromContext(ctx context.Context) *models.User {
@@ -321,6 +332,15 @@ func ActorFromContext(ctx context.Context) string {
 		return a
 	}
 	return "unknown"
+}
+
+// RawAPIKeyFromContext returns the raw API key string from the context.
+// Used for transport encryption of secret responses.
+func RawAPIKeyFromContext(ctx context.Context) string {
+	if k, ok := ctx.Value(rawAPIKeyKey).(string); ok {
+		return k
+	}
+	return ""
 }
 
 // JWTMiddleware validates a JWT from the Authorization header.
@@ -394,6 +414,7 @@ func (a *AuthService) APIKeyMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		ctx := context.WithValue(r.Context(), apiKeyKey, apiKey)
+		ctx = context.WithValue(ctx, rawAPIKeyKey, key)
 		ctx = context.WithValue(ctx, actorKey, apiKey.ID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})

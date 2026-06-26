@@ -49,6 +49,7 @@ func (s *Store) migrate() error {
 			description TEXT DEFAULT '',
 			type TEXT NOT NULL,
 			enabled INTEGER NOT NULL DEFAULT 0,
+			version INTEGER NOT NULL DEFAULT 1,
 			data TEXT NOT NULL DEFAULT '{}',
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -133,6 +134,8 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migration step: %w", err)
 		}
 	}
+	// Add version column if upgrading from older schema
+	s.db.Exec(`ALTER TABLE flags ADD COLUMN version INTEGER NOT NULL DEFAULT 1`)
 	return nil
 }
 
@@ -197,13 +200,13 @@ func (s *Store) CreateFlag(flag *models.Flag) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`INSERT INTO flags (id, key, name, description, type, enabled, data) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		flag.ID, flag.Key, flag.Name, flag.Description, flag.Type, boolToInt(flag.Enabled), string(data))
+	_, err = s.db.Exec(`INSERT INTO flags (id, key, name, description, type, enabled, version, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		flag.ID, flag.Key, flag.Name, flag.Description, flag.Type, boolToInt(flag.Enabled), flag.Version, string(data))
 	return err
 }
 
 func (s *Store) ListFlags() ([]models.Flag, error) {
-	rows, err := s.db.Query(`SELECT id, key, name, description, type, enabled, data, created_at, updated_at FROM flags ORDER BY created_at DESC`)
+	rows, err := s.db.Query(`SELECT id, key, name, description, type, enabled, version, data, created_at, updated_at FROM flags ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -220,12 +223,12 @@ func (s *Store) ListFlags() ([]models.Flag, error) {
 }
 
 func (s *Store) GetFlag(id string) (*models.Flag, error) {
-	row := s.db.QueryRow(`SELECT id, key, name, description, type, enabled, data, created_at, updated_at FROM flags WHERE id = ?`, id)
+	row := s.db.QueryRow(`SELECT id, key, name, description, type, enabled, version, data, created_at, updated_at FROM flags WHERE id = ?`, id)
 	return scanFlag(row)
 }
 
 func (s *Store) GetFlagByKey(key string) (*models.Flag, error) {
-	row := s.db.QueryRow(`SELECT id, key, name, description, type, enabled, data, created_at, updated_at FROM flags WHERE key = ?`, key)
+	row := s.db.QueryRow(`SELECT id, key, name, description, type, enabled, version, data, created_at, updated_at FROM flags WHERE key = ?`, key)
 	return scanFlag(row)
 }
 
@@ -238,8 +241,8 @@ func (s *Store) UpdateFlag(flag *models.Flag) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`UPDATE flags SET key=?, name=?, description=?, type=?, enabled=?, data=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-		flag.Key, flag.Name, flag.Description, flag.Type, boolToInt(flag.Enabled), string(data), flag.ID)
+	_, err = s.db.Exec(`UPDATE flags SET key=?, name=?, description=?, type=?, enabled=?, version=?, data=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		flag.Key, flag.Name, flag.Description, flag.Type, boolToInt(flag.Enabled), flag.Version, string(data), flag.ID)
 	return err
 }
 
@@ -254,9 +257,9 @@ func (s *Store) GetFlagConfig(flagID, envID string) (*models.Flag, error) {
 	var f models.Flag
 	var dataStr string
 	var enabled int
-	err := s.db.QueryRow(`SELECT f.id, f.key, f.name, f.description, f.type, fc.enabled, fc.data, f.created_at, f.updated_at
+	err := s.db.QueryRow(`SELECT f.id, f.key, f.name, f.description, f.type, fc.enabled, f.version, fc.data, f.created_at, f.updated_at
 		FROM flags f JOIN flag_configs fc ON fc.flag_id = f.id WHERE fc.flag_id = ? AND fc.environment_id = ?`, flagID, envID).
-		Scan(&f.ID, &f.Key, &f.Name, &f.Description, &f.Type, &enabled, &dataStr, &f.CreatedAt, &f.UpdatedAt)
+		Scan(&f.ID, &f.Key, &f.Name, &f.Description, &f.Type, &enabled, &f.Version, &dataStr, &f.CreatedAt, &f.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -337,8 +340,16 @@ func (s *Store) CreateAPIKey(key *models.APIKey) error {
 	if err != nil {
 		return err
 	}
+	var expiresAt any
+	if key.ExpiresAt != nil {
+		expiresAt = key.ExpiresAt
+	}
+	var envID any
+	if key.EnvironmentID != "" {
+		envID = key.EnvironmentID
+	}
 	_, err = s.db.Exec(`INSERT INTO api_keys (id, name, key_hash, key_prefix, environment_id, scopes, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		key.ID, key.Name, key.KeyHash, key.KeyPrefix, key.EnvironmentID, string(scopes), key.ExpiresAt)
+		key.ID, key.Name, key.KeyHash, key.KeyPrefix, envID, string(scopes), expiresAt)
 	return err
 }
 
@@ -480,7 +491,7 @@ func scanFlag(row scanner) (*models.Flag, error) {
 	var f models.Flag
 	var dataStr string
 	var enabled int
-	if err := row.Scan(&f.ID, &f.Key, &f.Name, &f.Description, &f.Type, &enabled, &dataStr, &f.CreatedAt, &f.UpdatedAt); err != nil {
+	if err := row.Scan(&f.ID, &f.Key, &f.Name, &f.Description, &f.Type, &enabled, &f.Version, &dataStr, &f.CreatedAt, &f.UpdatedAt); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}

@@ -14,6 +14,7 @@ RUN go mod download
 COPY . .
 COPY --from=frontend-builder /app/web/dist ./web/dist
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o reflag .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o reflag-run ./cmd/reflag-run/
 
 # --- Stage 3: Runtime ---
 FROM alpine:3.21
@@ -22,6 +23,7 @@ RUN apk add --no-cache ca-certificates tzdata wget && \
 
 WORKDIR /app
 COPY --from=go-builder /app/reflag /app/reflag
+COPY --from=go-builder /app/reflag-run /app/reflag-run
 
 RUN mkdir -p /app/data && chown -R app:app /app
 USER app

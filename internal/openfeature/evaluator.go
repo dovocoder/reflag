@@ -6,61 +6,114 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/dovocoder/reflag/internal/models"
 )
 
-// SecretResolver is a function that resolves a secret key to its decrypted value.
-// If the secret doesn't exist or decryption fails, it returns ("", error).
+// --- OpenFeature spec constants ---
+
+// Reason codes per OpenFeature specification section 2.5.1
+const (
+	ReasonTargetingMatch = "TARGETING_MATCH"
+	ReasonSplit          = "SPLIT"
+	ReasonDisabled       = "DISABLED"
+	ReasonDefault        = "DEFAULT"
+	ReasonStatic         = "STATIC"
+	ReasonUnknown        = "UNKNOWN"
+	ReasonError          = "ERROR"
+)
+
+// Error codes per OpenFeature specification section 2.5.5
+const (
+	ErrProviderNotReady  = "PROVIDER_NOT_READY"
+	ErrProviderFatal     = "PROVIDER_FATAL"
+	ErrFlagNotFound      = "FLAG_NOT_FOUND"
+	ErrParseError        = "PARSE_ERROR"
+	ErrTypeMismatch      = "TYPE_MISMATCH"
+	ErrInvalidContext    = "INVALID_CONTEXT"
+	ErrGeneral           = "GENERAL"
+	ErrSecretNotFound    = "SECRET_NOT_FOUND"
+	ErrSecretResolution  = "SECRET_RESOLUTION_FAILED"
+)
+
+// FlagMetadata keys
+const (
+	MetaFlagKey      = "flagKey"
+	MetaFlagVersion  = "version"
+	MetaEnvironment  = "environment"
+)
+
+// SecretResolver resolves a secret key to its decrypted value.
 type SecretResolver func(key string) (string, error)
 
-// ResolutionContext provides evaluation-time metadata.
-type ResolutionContext struct {
+// EvaluationContext provides evaluation-time metadata per OpenFeature spec section 2.2.
+type EvaluationContext struct {
 	TargetingKey string         `json:"targetingKey,omitempty"`
 	Attributes   map[string]any `json:"attributes,omitempty"`
 }
 
-// ResolutionDetail holds the result of flag evaluation.
+// ResolutionDetail holds the result of flag evaluation per OpenFeature spec section 2.5.
 type ResolutionDetail struct {
-	Value      any             `json:"value"`
-	Variant    string          `json:"variant"`
-	Reason     string          `json:"reason"` // DEFAULT, TARGETING_MATCH, DISABLED, ERROR
-	ErrorCode  string          `json:"errorCode,omitempty"`
-	ErrorMsg   string          `json:"errorMessage,omitempty"`
+	Value        any            `json:"value"`
+	Variant      string         `json:"variant"`
+	Reason       string         `json:"reason"`
+	ErrorCode    string         `json:"errorCode,omitempty"`
+	ErrorMessage string         `json:"errorMessage,omitempty"`
 	FlagMetadata map[string]any `json:"flagMetadata,omitempty"`
 }
 
-// EvaluationError represents an evaluation error.
-type EvaluationError struct {
-	Code        string `json:"errorCode"`
-	Message     string `json:"errorMessage"`
-}
-
-func (e *EvaluationError) Error() string {
-	return fmt.Sprintf("%s: %s", e.Code, e.Message)
+// EvaluationRequest is the standard request for flag evaluation.
+type EvaluationRequest struct {
+	FlagKey      string             `json:"flagKey"`
+	DefaultValue any               `json:"defaultValue"`
+	Environment  string             `json:"environment,omitempty"`
+	Context      EvaluationContext  `json:"context,omitempty"`
 }
 
 // Evaluate resolves a flag against the given evaluation context.
-// This implements the OpenFeature evaluation logic.
-func Evaluate(flag *models.Flag, envKey string, ctx ResolutionContext) ResolutionDetail {
-	// Flag is disabled — return the default variation
+// This implements the OpenFeature evaluation logic per spec sections 2.3-2.5.
+func Evaluate(flag *models.Flag, envKey string, ctx EvaluationContext) ResolutionDetail {
+	// Build flag metadata
+	metadata := map[string]any{
+		MetaFlagKey: flag.Key,
+	}
+	if flag.Version > 0 {
+		metadata[MetaFlagVersion] = flag.Version
+	}
+	if envKey != "" {
+		metadata[MetaEnvironment] = envKey
+	}
+
+	// Flag is disabled — return the default variation with DISABLED reason
 	if !flag.Enabled {
+		if flag.DefaultRule != nil {
+			return ResolutionDetail{
+				Value:        getVariationValueByID(flag, flag.DefaultRule.VariationID),
+				Variant:      getVariationLabelByID(flag, flag.DefaultRule.VariationID),
+				Reason:       ReasonDisabled,
+				FlagMetadata: metadata,
+			}
+		}
+		// Disabled with no default rule — error
 		return ResolutionDetail{
-			Value:   getVariationValue(flag, flag.DefaultRule),
-			Variant: getVariationLabel(flag, flag.DefaultRule.VariationID),
-			Reason:  ReasonDisabled,
+			Reason:       ReasonError,
+			ErrorCode:    ErrParseError,
+			ErrorMessage: "flag is disabled and has no default rule",
+			FlagMetadata: metadata,
 		}
 	}
 
-	// Try targeting rules first (in order)
+	// Try targeting rules first (in order — first match wins)
 	for _, rule := range flag.Targeting {
 		if matchesAllConditions(rule.Conditions, ctx) {
 			return ResolutionDetail{
-				Value:   getVariationValueByID(flag, rule.VariationID),
-				Variant: getVariationLabelByID(flag, rule.VariationID),
-				Reason:  ReasonTargetingMatch,
+				Value:        getVariationValueByID(flag, rule.VariationID),
+				Variant:      getVariationLabelByID(flag, rule.VariationID),
+				Reason:       ReasonTargetingMatch,
+				FlagMetadata: metadata,
 			}
 		}
 	}
@@ -70,53 +123,100 @@ func Evaluate(flag *models.Flag, envKey string, ctx ResolutionContext) Resolutio
 		if len(flag.DefaultRule.Percentage) > 0 {
 			variationID := percentageBucket(flag.Key, envKey, ctx.TargetingKey, flag.DefaultRule.Percentage)
 			return ResolutionDetail{
-				Value:   getVariationValueByID(flag, variationID),
-				Variant: getVariationLabelByID(flag, variationID),
-				Reason:  ReasonSplit,
+				Value:        getVariationValueByID(flag, variationID),
+				Variant:      getVariationLabelByID(flag, variationID),
+				Reason:       ReasonSplit,
+				FlagMetadata: metadata,
 			}
 		}
 		return ResolutionDetail{
-			Value:   getVariationValueByID(flag, flag.DefaultRule.VariationID),
-			Variant: getVariationLabelByID(flag, flag.DefaultRule.VariationID),
-			Reason:  ReasonDefault,
+			Value:        getVariationValueByID(flag, flag.DefaultRule.VariationID),
+			Variant:      getVariationLabelByID(flag, flag.DefaultRule.VariationID),
+			Reason:       ReasonDefault,
+			FlagMetadata: metadata,
 		}
 	}
 
 	// No default rule — error
 	return ResolutionDetail{
-		Value:     nil,
-		Reason:    ReasonError,
-		ErrorCode: "FLAG_NOT_CONFIGURED",
-		ErrorMsg:  "flag has no default rule configured",
+		Reason:       ReasonError,
+		ErrorCode:    ErrParseError,
+		ErrorMessage: "flag has no default rule configured",
+		FlagMetadata: metadata,
 	}
 }
 
-// EvaluateWithSecrets works like Evaluate but resolves any variation values
-// that are secret references ({"$secret": "KEY"}) to their decrypted values.
-// If resolver is nil, secret references are returned as-is (the JSON object).
-func EvaluateWithSecrets(flag *models.Flag, envKey string, ctx ResolutionContext, resolver SecretResolver) ResolutionDetail {
+// EvaluateWithType resolves a flag and validates the return type matches the expected type.
+// Returns TYPE_MISMATCH error if the resolved value doesn't match the requested type.
+func EvaluateWithType(flag *models.Flag, envKey string, ctx EvaluationContext, expectedType models.FlagType) ResolutionDetail {
 	detail := Evaluate(flag, envKey, ctx)
-	if resolver == nil {
+
+	// Don't type-check errors
+	if detail.Reason == ReasonError {
 		return detail
 	}
-	// Check if the resolved value is a secret reference
-	if detail.Value == nil {
-		return detail
+
+	if !validateType(detail.Value, expectedType) {
+		return ResolutionDetail{
+			Value:        nil,
+			Variant:      detail.Variant,
+			Reason:       ReasonError,
+			ErrorCode:    ErrTypeMismatch,
+			ErrorMessage: fmt.Sprintf("expected %s, got %T", expectedType, detail.Value),
+			FlagMetadata: detail.FlagMetadata,
+		}
 	}
-	resolvedValue, err := resolveSecretValue(detail.Value, resolver)
-	if err != nil {
-		detail.Reason = ReasonError
-		detail.ErrorCode = "SECRET_RESOLUTION_FAILED"
-		detail.ErrorMsg = err.Error()
-		return detail
-	}
-	detail.Value = resolvedValue
+
 	return detail
 }
 
-// resolveSecretValue checks if a value is a secret reference and resolves it.
-// A secret reference is an object with a "$secret" key: {"$secret": "DATABASE_URL"}.
-// Non-secret values are returned as-is.
+// EvaluateWithSecrets resolves a flag and resolves any secret references.
+func EvaluateWithSecrets(flag *models.Flag, envKey string, ctx EvaluationContext, resolver SecretResolver) ResolutionDetail {
+	detail := Evaluate(flag, envKey, ctx)
+	if resolver == nil || detail.Value == nil || detail.Reason == ReasonError {
+		return detail
+	}
+	resolved, err := resolveSecretValue(detail.Value, resolver)
+	if err != nil {
+		return ResolutionDetail{
+			Reason:       ReasonError,
+			ErrorCode:    ErrSecretResolution,
+			ErrorMessage: err.Error(),
+			FlagMetadata: detail.FlagMetadata,
+		}
+	}
+	detail.Value = resolved
+	return detail
+}
+
+// validateType checks if a value matches the expected OpenFeature flag type.
+func validateType(val any, expectedType models.FlagType) bool {
+	switch expectedType {
+	case models.FlagTypeBoolean:
+		_, ok := val.(bool)
+		return ok
+	case models.FlagTypeString:
+		_, ok := val.(string)
+		return ok
+	case models.FlagTypeNumber:
+		switch val.(type) {
+		case float64, float32, int, int64, int32, json.Number:
+			return true
+		}
+		return false
+	case models.FlagTypeObject:
+		// Objects can be maps or nil — but not primitives
+		switch val.(type) {
+		case map[string]any, []any, nil:
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// resolveSecretValue resolves a {"$secret": "KEY"} reference to its decrypted value.
 func resolveSecretValue(val any, resolver SecretResolver) (any, error) {
 	m, ok := val.(map[string]any)
 	if !ok {
@@ -124,32 +224,24 @@ func resolveSecretValue(val any, resolver SecretResolver) (any, error) {
 	}
 	secretKey, hasRef := m["$secret"]
 	if !hasRef {
-		return val, nil // regular object, not a secret ref
+		return val, nil
 	}
 	keyStr, ok := secretKey.(string)
 	if !ok {
-		return nil, fmt.Errorf("$secret value must be a string, got %T", secretKey)
+		return nil, fmt.Errorf("$secret value must be a string")
 	}
 	decrypted, err := resolver(keyStr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve secret %q: %w", keyStr, err)
+		return nil, fmt.Errorf("secret %q: %w", keyStr, err)
 	}
 	return decrypted, nil
 }
 
-const (
-	ReasonTargetingMatch = "TARGETING_MATCH"
-	ReasonSplit         = "SPLIT"
-	ReasonDisabled      = "DISABLED"
-	ReasonDefault       = "DEFAULT"
-	ReasonError         = "ERROR"
-	ReasonNotFound      = "FLAG_NOT_FOUND"
-)
+// --- Targeting rule evaluation ---
 
-// matchesAllConditions checks if all conditions in a rule match the context.
-func matchesAllConditions(conditions []models.Condition, ctx ResolutionContext) bool {
+func matchesAllConditions(conditions []models.Condition, ctx EvaluationContext) bool {
 	if len(conditions) == 0 {
-		return false // empty conditions never match
+		return false
 	}
 	for _, cond := range conditions {
 		if !matchesCondition(cond, ctx) {
@@ -159,19 +251,16 @@ func matchesAllConditions(conditions []models.Condition, ctx ResolutionContext) 
 	return true
 }
 
-// matchesCondition evaluates a single condition against the context.
-func matchesCondition(cond models.Condition, ctx ResolutionContext) bool {
+func matchesCondition(cond models.Condition, ctx EvaluationContext) bool {
 	var attrVal any
 	if cond.Attribute == "targetingKey" {
 		attrVal = ctx.TargetingKey
 	} else {
 		attrVal = ctx.Attributes[cond.Attribute]
 	}
-
 	if attrVal == nil {
 		return false
 	}
-
 	attrStr := fmt.Sprintf("%v", attrVal)
 
 	switch cond.Operator {
@@ -277,7 +366,12 @@ func matchesCondition(cond models.Condition, ctx ResolutionContext) bool {
 	case "not_empty", "NOT_EMPTY":
 		return attrStr != ""
 	case "regex", "REGEX":
-		// Regex matching is not enabled by default for security
+		for _, v := range cond.Values {
+			re, err := regexp.Compile(v)
+			if err == nil && re.MatchString(attrStr) {
+				return true
+			}
+		}
 		return false
 	default:
 		return false
@@ -285,22 +379,18 @@ func matchesCondition(cond models.Condition, ctx ResolutionContext) bool {
 }
 
 // percentageBucket determines which variation a key falls into using
-// a deterministic hash-based bucketing algorithm (OpenFeature spec compliant).
+// deterministic SHA-256 hash-based bucketing (OpenFeature spec compliant).
 func percentageBucket(flagKey, envKey, targetingKey string, percentages map[string]int) string {
-	// Sort variation IDs for deterministic bucketing
 	variationIDs := make([]string, 0, len(percentages))
 	for id := range percentages {
 		variationIDs = append(variationIDs, id)
 	}
 	sort.Strings(variationIDs)
 
-	// Compute hash
 	hashInput := fmt.Sprintf("%s:%s:%s", flagKey, envKey, targetingKey)
 	h := sha256.Sum256([]byte(hashInput))
-	// Use first 8 bytes as uint64
 	bucket := binary.BigEndian.Uint64(h[:8]) % 100
 
-	// Walk the bucket ranges
 	cumulative := 0
 	for _, id := range variationIDs {
 		cumulative += percentages[id]
@@ -308,20 +398,11 @@ func percentageBucket(flagKey, envKey, targetingKey string, percentages map[stri
 			return id
 		}
 	}
-
-	// Fallback to first variation
 	return variationIDs[0]
 }
 
-// getVariationValue returns the value for the default rule's variation.
-func getVariationValue(flag *models.Flag, rule *models.DefaultRule) any {
-	if rule == nil {
-		return nil
-	}
-	return getVariationValueByID(flag, rule.VariationID)
-}
+// --- Helpers ---
 
-// getVariationValueByID finds a variation by ID and returns its value.
 func getVariationValueByID(flag *models.Flag, variationID string) any {
 	for _, v := range flag.Variations {
 		if v.ID == variationID {
@@ -335,7 +416,6 @@ func getVariationValueByID(flag *models.Flag, variationID string) any {
 	return nil
 }
 
-// getVariationLabelByID returns the human-readable label for a variation.
 func getVariationLabelByID(flag *models.Flag, variationID string) string {
 	for _, v := range flag.Variations {
 		if v.ID == variationID {
@@ -343,10 +423,6 @@ func getVariationLabelByID(flag *models.Flag, variationID string) string {
 		}
 	}
 	return ""
-}
-
-func getVariationLabel(flag *models.Flag, variationID string) string {
-	return getVariationLabelByID(flag, variationID)
 }
 
 func toFloat64(v any) (float64, bool) {

@@ -38,12 +38,28 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/auth/oidc/start", h.oidcStart)
 	mux.HandleFunc("POST /api/auth/oidc/callback", h.oidcCallback)
 
-	// Evaluation route (API key or JWT)
+	// Evaluation routes (API key or JWT) — OpenFeature HTTP API
 	evalMux := http.NewServeMux()
 	evalMux.HandleFunc("POST /api/v1/flags/evaluate", h.evaluateFlag)
 	evalMux.HandleFunc("POST /api/v1/flags/{key}/evaluate", h.evaluateFlagByKey)
+	// Type-specific evaluation endpoints
+	evalMux.HandleFunc("POST /api/v1/flags/boolean", h.evaluateBoolean)
+	evalMux.HandleFunc("POST /api/v1/flags/string", h.evaluateString)
+	evalMux.HandleFunc("POST /api/v1/flags/number", h.evaluateNumber)
+	evalMux.HandleFunc("POST /api/v1/flags/object", h.evaluateObject)
+	evalMux.HandleFunc("POST /api/v1/flags/{key}/boolean", h.evaluateBoolean)
+	evalMux.HandleFunc("POST /api/v1/flags/{key}/string", h.evaluateString)
+	evalMux.HandleFunc("POST /api/v1/flags/{key}/number", h.evaluateNumber)
+	evalMux.HandleFunc("POST /api/v1/flags/{key}/object", h.evaluateObject)
 	evalMux.HandleFunc("GET /api/v1/flags", h.listFlagsForClient)
-	mux.Handle("/api/v1/", h.auth.AnyAuthMiddleware(evalMux))
+	mux.Handle("/api/v1/flags", h.auth.AnyAuthMiddleware(evalMux))
+	mux.Handle("/api/v1/flags/", h.auth.AnyAuthMiddleware(evalMux))
+
+	// Secrets resolve routes (API key only — encrypted response)
+	resolveMux := http.NewServeMux()
+	resolveMux.HandleFunc("POST /api/v1/secrets/{key}/resolve", h.resolveSecret)
+	resolveMux.HandleFunc("POST /api/v1/secrets/resolve", h.resolveAllSecrets)
+	mux.Handle("/api/v1/secrets/", h.auth.APIKeyMiddleware(resolveMux))
 
 	// Admin routes (JWT only)
 	adminMux := http.NewServeMux()
@@ -85,11 +101,6 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 
 	// All admin routes require JWT
 	mux.Handle("/api/", h.auth.JWTMiddleware(adminMux))
-
-	// Secrets resolve endpoint (API key only — for programmatic access)
-	resolveMux := http.NewServeMux()
-	resolveMux.HandleFunc("POST /api/v1/secrets/{key}/resolve", h.resolveSecret)
-	mux.Handle("/api/v1/secrets/", h.auth.APIKeyMiddleware(resolveMux))
 }
 
 // --- Health ---
@@ -137,71 +148,148 @@ func (h *Handler) oidcCallback(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// --- Flag Evaluation (OpenFeature compatible) ---
+// --- Flag Evaluation (OpenFeature HTTP API compliant) ---
 
 func (h *Handler) evaluateFlag(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		FlagKey string                       `json:"flagKey"`
-		EnvKey  string                       `json:"environment"`
-		Context openfeature.ResolutionContext `json:"context"`
-	}
+	var req openfeature.EvaluationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		middleware.JSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	flag, err := h.store.GetFlagByKey(req.FlagKey)
-	if err != nil {
-		middleware.JSONError(w, http.StatusInternalServerError, "database error")
+	if req.FlagKey == "" {
+		middleware.JSONError(w, http.StatusBadRequest, "flagKey is required")
 		return
 	}
-	if flag == nil {
-		middleware.JSONResponse(w, http.StatusNotFound, map[string]any{
-			"errorCode":   openfeature.ReasonNotFound,
-			"errorMessage": "flag not found",
-		})
-		return
-	}
-	// Check for environment-specific config
-	if req.EnvKey != "" {
-		env, _ := h.store.GetEnvironmentByKey(req.EnvKey)
-		if env != nil {
-			if envFlag, _ := h.store.GetFlagConfig(flag.ID, env.ID); envFlag != nil {
-				flag = envFlag
-			}
-		}
-	}
-	detail := openfeature.Evaluate(flag, req.EnvKey, req.Context)
-	detail = h.resolveSecretRefs(flag, detail)
+	detail := h.evaluateFlagInternal(w, r, req)
 	middleware.JSONResponse(w, http.StatusOK, detail)
 }
 
 func (h *Handler) evaluateFlagByKey(w http.ResponseWriter, r *http.Request) {
 	flagKey := r.PathValue("key")
 	var req struct {
-		EnvKey  string                        `json:"environment"`
-		Context openfeature.ResolutionContext `json:"context"`
+		DefaultValue any                    `json:"defaultValue"`
+		Environment  string                 `json:"environment,omitempty"`
+		Context      openfeature.EvaluationContext `json:"context,omitempty"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
+	detail := h.evaluateFlagInternal(w, r, openfeature.EvaluationRequest{
+		FlagKey:      flagKey,
+		DefaultValue: req.DefaultValue,
+		Environment:  req.Environment,
+		Context:      req.Context,
+	})
+	middleware.JSONResponse(w, http.StatusOK, detail)
+}
 
-	flag, err := h.store.GetFlagByKey(flagKey)
-	if err != nil || flag == nil {
-		middleware.JSONResponse(w, http.StatusNotFound, map[string]any{
-			"errorCode":   openfeature.ReasonNotFound,
-			"errorMessage": "flag not found",
+// evaluateFlagType evaluates a flag with type validation.
+// Used by /boolean, /string, /number, /object endpoints.
+func (h *Handler) evaluateFlagType(w http.ResponseWriter, r *http.Request, expectedType models.FlagType) {
+	var req openfeature.EvaluationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		middleware.JSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.FlagKey == "" {
+		// Try path value
+		req.FlagKey = r.PathValue("key")
+	}
+
+	flag, err := h.store.GetFlagByKey(req.FlagKey)
+	if err != nil {
+		middleware.JSONResponse(w, http.StatusOK, openfeature.ResolutionDetail{
+			Value:        req.DefaultValue,
+			Reason:       openfeature.ReasonError,
+			ErrorCode:    openfeature.ErrProviderFatal,
+			ErrorMessage: "database error",
 		})
 		return
 	}
-	if req.EnvKey != "" {
-		env, _ := h.store.GetEnvironmentByKey(req.EnvKey)
+	if flag == nil {
+		middleware.JSONResponse(w, http.StatusOK, openfeature.ResolutionDetail{
+			Value:        req.DefaultValue,
+			Reason:       openfeature.ReasonError,
+			ErrorCode:    openfeature.ErrFlagNotFound,
+			ErrorMessage: fmt.Sprintf("flag %q not found", req.FlagKey),
+		})
+		return
+	}
+
+	// Check for environment-specific config
+	if req.Environment != "" {
+		env, _ := h.store.GetEnvironmentByKey(req.Environment)
 		if env != nil {
 			if envFlag, _ := h.store.GetFlagConfig(flag.ID, env.ID); envFlag != nil {
 				flag = envFlag
 			}
 		}
 	}
-	detail := openfeature.Evaluate(flag, req.EnvKey, req.Context)
+
+	detail := openfeature.EvaluateWithType(flag, req.Environment, req.Context, expectedType)
 	detail = h.resolveSecretRefs(flag, detail)
+
+	// On error, return the defaultValue from the request
+	if detail.Reason == openfeature.ReasonError {
+		detail.Value = req.DefaultValue
+	}
+
 	middleware.JSONResponse(w, http.StatusOK, detail)
+}
+
+func (h *Handler) evaluateBoolean(w http.ResponseWriter, r *http.Request) {
+	h.evaluateFlagType(w, r, models.FlagTypeBoolean)
+}
+
+func (h *Handler) evaluateString(w http.ResponseWriter, r *http.Request) {
+	h.evaluateFlagType(w, r, models.FlagTypeString)
+}
+
+func (h *Handler) evaluateNumber(w http.ResponseWriter, r *http.Request) {
+	h.evaluateFlagType(w, r, models.FlagTypeNumber)
+}
+
+func (h *Handler) evaluateObject(w http.ResponseWriter, r *http.Request) {
+	h.evaluateFlagType(w, r, models.FlagTypeObject)
+}
+
+// evaluateFlagInternal handles the core evaluation logic shared by all endpoints.
+func (h *Handler) evaluateFlagInternal(w http.ResponseWriter, r *http.Request, req openfeature.EvaluationRequest) openfeature.ResolutionDetail {
+	flag, err := h.store.GetFlagByKey(req.FlagKey)
+	if err != nil {
+		return openfeature.ResolutionDetail{
+			Value:        req.DefaultValue,
+			Reason:       openfeature.ReasonError,
+			ErrorCode:    openfeature.ErrProviderFatal,
+			ErrorMessage: "database error",
+		}
+	}
+	if flag == nil {
+		return openfeature.ResolutionDetail{
+			Value:        req.DefaultValue,
+			Reason:       openfeature.ReasonError,
+			ErrorCode:    openfeature.ErrFlagNotFound,
+			ErrorMessage: fmt.Sprintf("flag %q not found", req.FlagKey),
+		}
+	}
+
+	// Check for environment-specific config
+	if req.Environment != "" {
+		env, _ := h.store.GetEnvironmentByKey(req.Environment)
+		if env != nil {
+			if envFlag, _ := h.store.GetFlagConfig(flag.ID, env.ID); envFlag != nil {
+				flag = envFlag
+			}
+		}
+	}
+
+	detail := openfeature.Evaluate(flag, req.Environment, req.Context)
+	detail = h.resolveSecretRefs(flag, detail)
+
+	// On error, return the defaultValue from the request
+	if detail.Reason == openfeature.ReasonError {
+		detail.Value = req.DefaultValue
+	}
+
+	return detail
 }
 
 func (h *Handler) listFlagsForClient(w http.ResponseWriter, r *http.Request) {
@@ -248,6 +336,14 @@ func (h *Handler) createFlag(w http.ResponseWriter, r *http.Request) {
 	}
 	if flag.Key == "" {
 		middleware.JSONError(w, http.StatusBadRequest, "key is required")
+		return
+	}
+	if !isValidFlagKey(flag.Key) {
+		middleware.JSONError(w, http.StatusBadRequest, "key must be alphanumeric with dashes/underscores, max 128 chars")
+		return
+	}
+	if len(flag.Name) > 256 {
+		middleware.JSONError(w, http.StatusBadRequest, "name too long (max 256 chars)")
 		return
 	}
 	flag.ID = uuid.New().String()
@@ -588,6 +684,10 @@ func (h *Handler) addOrgMember(w http.ResponseWriter, r *http.Request) {
 	if req.Role == "" {
 		req.Role = "member"
 	}
+	if !isValidRole(req.Role) {
+		middleware.JSONError(w, http.StatusBadRequest, "invalid role — must be owner, admin, member, or viewer")
+		return
+	}
 	// Find user by email
 	user, err := h.store.GetUserByEmail(req.Email)
 	if err != nil || user == nil {
@@ -627,6 +727,10 @@ func (h *Handler) updateOrgMemberRole(w http.ResponseWriter, r *http.Request) {
 		middleware.JSONError(w, http.StatusBadRequest, "role is required")
 		return
 	}
+	if !isValidRole(req.Role) {
+		middleware.JSONError(w, http.StatusBadRequest, "invalid role — must be owner, admin, member, or viewer")
+		return
+	}
 	if err := h.store.UpdateOrgMemberRole(memberID, req.Role); err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to update role")
 		return
@@ -647,6 +751,32 @@ func (h *Handler) removeOrgMember(w http.ResponseWriter, r *http.Request) {
 
 // --- Helpers ---
 
+// isValidFlagKey validates that a flag key contains only safe characters.
+func isValidFlagKey(key string) bool {
+	if len(key) == 0 || len(key) > 128 {
+		return false
+	}
+	for _, c := range key {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+// isValidRole checks if a role is one of the allowed values.
+var validRoles = map[string]bool{
+	"owner":  true,
+	"admin":  true,
+	"member": true,
+	"viewer": true,
+}
+
+func isValidRole(role string) bool {
+	return validRoles[role]
+}
+
 func (h *Handler) audit(actor, action, resource, resourceID, details string) {
 	entry := &models.AuditLogEntry{
 		ID:         uuid.New().String(),
@@ -666,35 +796,33 @@ func (h *Handler) resolveSecretRefs(_ *models.Flag, detail openfeature.Resolutio
 	if detail.Value == nil || detail.Reason == openfeature.ReasonError {
 		return detail
 	}
-	// Check if the value looks like a secret reference
 	m, ok := detail.Value.(map[string]any)
 	if !ok {
-		return detail // not a secret ref, return as-is
+		return detail
 	}
 	secretKey, hasRef := m["$secret"]
 	if !hasRef {
-		return detail // regular object, not a secret ref
+		return detail
 	}
 	keyStr, ok := secretKey.(string)
 	if !ok {
 		detail.Reason = openfeature.ReasonError
-		detail.ErrorCode = "SECRET_RESOLUTION_FAILED"
-		detail.ErrorMsg = "$secret value must be a string"
+		detail.ErrorCode = openfeature.ErrSecretResolution
+		detail.ErrorMessage = "$secret value must be a string"
 		return detail
 	}
-	// Look up and decrypt the secret
 	secret, err := h.store.GetSecretByKey(keyStr)
 	if err != nil || secret == nil {
 		detail.Reason = openfeature.ReasonError
-		detail.ErrorCode = "SECRET_NOT_FOUND"
-		detail.ErrorMsg = fmt.Sprintf("secret %q not found", keyStr)
+		detail.ErrorCode = openfeature.ErrSecretNotFound
+		detail.ErrorMessage = "secret not found"
 		return detail
 	}
 	decrypted, err := crypto.Decrypt(secret.EncryptedValue, h.secretsKey)
 	if err != nil {
 		detail.Reason = openfeature.ReasonError
-		detail.ErrorCode = "SECRET_RESOLUTION_FAILED"
-		detail.ErrorMsg = fmt.Sprintf("failed to decrypt secret %q", keyStr)
+		detail.ErrorCode = openfeature.ErrSecretResolution
+		detail.ErrorMessage = "failed to decrypt secret"
 		return detail
 	}
 	detail.Value = decrypted
@@ -859,7 +987,7 @@ func (h *Handler) resolveSecret(w http.ResponseWriter, r *http.Request) {
 	secret, err := h.store.GetSecretByKey(key)
 	if err != nil || secret == nil {
 		middleware.JSONResponse(w, http.StatusNotFound, map[string]any{
-			"errorCode":   "SECRET_NOT_FOUND",
+			"errorCode":    "SECRET_NOT_FOUND",
 			"errorMessage": "secret not found",
 		})
 		return
@@ -870,8 +998,57 @@ func (h *Handler) resolveSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.audit(auth.ActorFromContext(r.Context()), "RESOLVE", "secret", secret.ID, secret.Key)
-	middleware.JSONResponse(w, http.StatusOK, map[string]any{
+	h.writeEncrypted(w, r, map[string]any{
 		"key":   secret.Key,
 		"value": decrypted,
+	})
+}
+
+func (h *Handler) resolveAllSecrets(w http.ResponseWriter, r *http.Request) {
+	secrets, err := h.store.ListSecrets()
+	if err != nil {
+		middleware.JSONError(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	result := make(map[string]string, len(secrets))
+	for _, s := range secrets {
+		decrypted, err := crypto.Decrypt(s.EncryptedValue, h.secretsKey)
+		if err != nil {
+			continue
+		}
+		result[s.Key] = decrypted
+	}
+	h.audit(auth.ActorFromContext(r.Context()), "RESOLVE_ALL", "secret", "", "bulk resolve")
+	h.writeEncrypted(w, r, result)
+}
+
+// writeEncrypted encrypts the response body using a transport key derived
+// from the API key. The response contains the encrypted payload and metadata.
+// Falls back to plain JSON if no API key is available (shouldn't happen for resolve endpoints).
+func (h *Handler) writeEncrypted(w http.ResponseWriter, r *http.Request, data any) {
+	rawKey := auth.RawAPIKeyFromContext(r.Context())
+	if rawKey == "" {
+		// No API key in context — shouldn't happen, but fall back to plain JSON
+		middleware.JSONResponse(w, http.StatusOK, data)
+		return
+	}
+
+	transportKey := crypto.DeriveTransportKey(rawKey)
+
+	plaintext, err := json.Marshal(data)
+	if err != nil {
+		middleware.JSONError(w, http.StatusInternalServerError, "failed to marshal response")
+		return
+	}
+
+	encrypted, err := crypto.EncryptPayload(plaintext, transportKey)
+	if err != nil {
+		middleware.JSONError(w, http.StatusInternalServerError, "failed to encrypt response")
+		return
+	}
+
+	middleware.JSONResponse(w, http.StatusOK, map[string]any{
+		"encrypted": true,
+		"payload":   encrypted,
 	})
 }

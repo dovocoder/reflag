@@ -123,6 +123,22 @@ Response:
 }
 ```
 
+### Resolve All Secrets (API key only)
+
+```bash
+curl -X POST http://localhost:8080/api/v1/secrets/resolve \
+  -H "X-API-Key: rfk_..."
+```
+
+Response:
+```json
+{
+  "DATABASE_URL": "postgres://user:pass@host:5432/db",
+  "STRIPE_KEY": "sk_live_...",
+  "SENTRY_DSN": "https://abc@sentry.io/42"
+}
+```
+
 ### Evaluate a Secret Feature Flag
 
 Secret feature flags use `{"$secret": "KEY"}` as variation values. At evaluation time,
@@ -201,6 +217,56 @@ The evaluation endpoint returns standard OpenFeature reason codes:
 | `false` | `FALSE` | Boolean false |
 | `empty` | `EMPTY` | Empty string |
 | `not_empty` | `NOT_EMPTY` | Non-empty string |
+
+## CLI Tool: reflag-run
+
+`reflag-run` fetches secrets from Reflag and injects them as environment variables into a child process. Secret values are scrubbed from stdout and stderr.
+
+### Usage
+
+```bash
+# Set connection via env vars
+export REFLAG_URL=http://localhost:8080
+export REFLAG_API_KEY=rfk_...
+
+# Inject all secrets as env vars and run a command
+reflag-run -- node server.js
+
+# Only inject specific secrets
+reflag-run -only DATABASE_URL,STRIPE_KEY -- node server.js
+
+# Prefix env var names
+reflag-run -prefix SECRET_ -- node server.js
+
+# Dry run (list which secrets would be loaded, don't exec)
+reflag-run --dry-run
+
+# Verbose (prints loaded secret keys, never values)
+reflag-run -v -- python app.py
+```
+
+### How It Works
+
+1. Fetches all secrets via `POST /api/v1/secrets/resolve` (bulk resolve endpoint)
+2. Injects them as environment variables into the child process
+3. Captures the child's stdout and stderr through a scrubbing filter
+4. Replaces any secret value found in output with `***`
+
+### Scrubbing
+
+All secret values are replaced with `***` in the child's stdout and stderr. The scrubber handles values that span read boundaries by buffering. This prevents accidental leakage of secrets through error messages, stack traces, or debug output.
+
+### Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `-url` | `REFLAG_URL` env | Reflag API URL |
+| `-key` | `REFLAG_API_KEY` env | Reflag API key |
+| `-only` | (all) | Comma-separated secret keys to include |
+| `-prefix` | (none) | Prefix for env var names |
+| `-dry-run` | false | Resolve secrets, print keys, don't exec |
+| `-v` | false | Verbose: print loaded secret keys |
+| `-version` | false | Print version and exit |
 
 ## Security
 

@@ -25,7 +25,10 @@ import (
 var webFS embed.FS
 
 func main() {
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("Configuration error: %v", err)
+	}
 
 	// Initialize store
 	st, err := store.New(cfg.DBPath)
@@ -71,6 +74,7 @@ func main() {
 	rateLimiter := middleware.NewRateLimiter(100, time.Minute)
 
 	var finalHandler http.Handler = mux
+	finalHandler = middleware.MaxBodyMiddleware(finalHandler)
 	finalHandler = middleware.CSRFMiddleware(finalHandler)
 	finalHandler = middleware.RateLimitMiddleware(rateLimiter, finalHandler)
 	finalHandler = middleware.CORSMiddleware(finalHandler)
