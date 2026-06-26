@@ -5,6 +5,7 @@ A secure, self-hosted feature flag and remote configuration service with full [O
 ## Features
 
 - **Full OpenFeature Spec**: Boolean, string, number, and object flag types with targeting rules, percentage rollouts, and default rules
+- **Secrets Management**: Encrypted configuration secrets (API tokens, passwords) with AES-256-GCM encryption at rest
 - **Dual Authentication**: OIDC (admin UI) + API keys (programmatic SDK access)
 - **Environments**: Per-environment flag overrides (production, staging, etc.)
 - **Segments**: Reusable targeting segments for audience management
@@ -55,6 +56,7 @@ The Vite dev server proxies API calls to `:8080`.
 | `OIDC_CLIENT_ID` | (none) | OIDC client ID |
 | `OIDC_CLIENT_SECRET` | (none) | OIDC client secret |
 | `OIDC_REDIRECT_URL` | (none) | OIDC redirect URL |
+| `SECRETS_KEY` | (derived from JWT_SECRET) | Encryption key for secrets at rest (min 32 chars) |
 | `APP_ENV` | (none) | Set to `production` for prod mode |
 
 ## API
@@ -97,7 +99,24 @@ All admin endpoints require a JWT (from OIDC login):
 - `DELETE /api/segments/{id}` — Delete segment
 - `GET/POST /api/api-keys` — List/create API keys
 - `DELETE /api/api-keys/{id}` — Revoke API key
+- `GET/POST /api/secrets` — List/create secrets
+- `GET/PUT/DELETE /api/secrets/{id}` — Get/update/delete secret
 - `GET /api/audit` — View audit log
+
+### Resolve a Secret (API key only)
+
+```bash
+curl -X POST http://localhost:8080/api/v1/secrets/DATABASE_URL/resolve \
+  -H "X-API-Key: *** \
+```
+
+Response:
+```json
+{
+  "key": "DATABASE_URL",
+  "value": "postgres://user:***@host:5432/db"
+}
+```
 
 ## OpenFeature Evaluation Reasons
 
@@ -134,6 +153,7 @@ The evaluation endpoint returns standard OpenFeature reason codes:
 ## Security
 
 - **API Keys**: Generated with `crypto/rand`, stored as SHA-256 hashes, never logged in plaintext
+- **Secrets**: Encrypted at rest with AES-256-GCM (random nonce per secret), decrypted only on read
 - **JWT**: HS256 signed, 24-hour expiry, validated on every admin request
 - **Rate Limiting**: 100 requests/minute per IP (configurable)
 - **Security Headers**: CSP, X-Content-Type-Options, X-Frame-Options, Referrer-Policy, Permissions-Policy

@@ -15,6 +15,8 @@ type Config struct {
 	OIDCClientID  string
 	OIDCClientSec string
 	OIDCRedirect  string
+	// Encryption key for secrets at rest (derived from JWT_SECRET or SECRETS_KEY)
+	SecretsKey     string
 	IsProduction  bool
 }
 
@@ -38,6 +40,14 @@ func Load() *Config {
 	if isProd && len(jwtSecret) < 32 {
 		fmt.Fprintln(os.Stderr, "[reflag] WARNING: JWT_SECRET must be at least 32 characters in production")
 	}
+	// Secrets encryption key — use SECRETS_KEY if set, otherwise derive from JWT_SECRET
+	secretsKey := os.Getenv("SECRETS_KEY")
+	if secretsKey == "" {
+		secretsKey = jwtSecret
+	}
+	if isProd && len(secretsKey) < 32 {
+		fmt.Fprintln(os.Stderr, "[reflag] WARNING: SECRETS_KEY or JWT_SECRET must be at least 32 characters for secrets encryption")
+	}
 	return &Config{
 		Port:          port,
 		DBPath:        dbPath,
@@ -46,6 +56,7 @@ func Load() *Config {
 		OIDCClientID:  os.Getenv("OIDC_CLIENT_ID"),
 		OIDCClientSec: os.Getenv("OIDC_CLIENT_SECRET"),
 		OIDCRedirect:  os.Getenv("OIDC_REDIRECT_URL"),
+		SecretsKey:     secretsKey,
 		IsProduction:  isProd,
 	}
 }

@@ -41,7 +41,7 @@ func main() {
 	authSvc := auth.New(st, cfg.JWTSecret, cfg.OIDCIssuer, cfg.OIDCClientID, cfg.OIDCClientSec, cfg.OIDCRedirect)
 
 	// Initialize API handlers
-	handler := api.NewHandler(st, authSvc)
+	handler := api.NewHandler(st, authSvc, cfg.SecretsKey)
 
 	// Main mux
 	mux := http.NewServeMux()

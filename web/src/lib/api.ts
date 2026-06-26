@@ -124,6 +124,17 @@ export interface AuditEntry {
   timestamp: string;
 }
 
+export interface Secret {
+  id: string;
+  key: string;
+  name: string;
+  description: string;
+  value?: string;
+  environment_id?: string;
+  created_at: string;
+  updated_at: string;
+}
+
 // --- API Functions ---
 
 export const api = {
@@ -176,4 +187,14 @@ export const api = {
   // Audit
   listAudit: (limit = 50, offset = 0) =>
     request<AuditEntry[]>(`/audit?limit=${limit}&offset=${offset}`),
+
+  // Secrets
+  listSecrets: () => request<Secret[]>("/secrets"),
+  getSecret: (id: string) => request<Secret & { value: string }>(`/secrets/${id}`),
+  createSecret: (data: { key: string; name: string; description: string; value: string; environment_id: string }) =>
+    request<Secret>("/secrets", { method: "POST", body: JSON.stringify(data) }),
+  updateSecret: (id: string, data: Partial<Secret> & { value?: string }) =>
+    request<Secret>(`/secrets/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+  deleteSecret: (id: string) =>
+    request<void>(`/secrets/${id}`, { method: "DELETE" }),
 };

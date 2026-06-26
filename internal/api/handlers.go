@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/dovocoder/reflag/internal/auth"
+	"github.com/dovocoder/reflag/internal/crypto"
 	"github.com/dovocoder/reflag/internal/middleware"
 	"github.com/dovocoder/reflag/internal/models"
 	"github.com/dovocoder/reflag/internal/openfeature"
@@ -15,12 +16,17 @@ import (
 )
 
 type Handler struct {
-	store *store.Store
-	auth  *auth.AuthService
+	store     *store.Store
+	auth      *auth.AuthService
+	secretsKey []byte
 }
 
-func NewHandler(s *store.Store, a *auth.AuthService) *Handler {
-	return &Handler{store: s, auth: a}
+func NewHandler(s *store.Store, a *auth.AuthService, secretsKey string) *Handler {
+	return &Handler{
+		store:      s,
+		auth:       a,
+		secretsKey: crypto.DeriveKey(secretsKey),
+	}
 }
 
 // RegisterRoutes sets up all API routes on the given mux.
@@ -58,7 +64,18 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	adminMux.HandleFunc("DELETE /api/api-keys/{id}", h.revokeAPIKey)
 
 	adminMux.HandleFunc("GET /api/audit", h.listAuditEntries)
+
+	adminMux.HandleFunc("GET /api/secrets", h.listSecrets)
+	adminMux.HandleFunc("POST /api/secrets", h.createSecret)
+	adminMux.HandleFunc("GET /api/secrets/{id}", h.getSecret)
+	adminMux.HandleFunc("PUT /api/secrets/{id}", h.updateSecret)
+	adminMux.HandleFunc("DELETE /api/secrets/{id}", h.deleteSecret)
 	mux.Handle("/api/", h.auth.JWTMiddleware(adminMux))
+
+	// Secrets resolve endpoint (API key only — for programmatic access)
+	resolveMux := http.NewServeMux()
+	resolveMux.HandleFunc("POST /api/v1/secrets/{key}/resolve", h.resolveSecret)
+	mux.Handle("/api/v1/secrets/", h.auth.APIKeyMiddleware(resolveMux))
 }
 
 // --- Health ---
@@ -456,4 +473,179 @@ func (h *Handler) audit(actor, action, resource, resourceID, details string) {
 		Details:    details,
 	}
 	_ = h.store.CreateAuditEntry(entry)
+}
+
+// --- Secrets ---
+
+func (h *Handler) listSecrets(w http.ResponseWriter, r *http.Request) {
+	secrets, err := h.store.ListSecrets()
+	if err != nil {
+		middleware.JSONError(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	if secrets == nil {
+		secrets = []models.Secret{}
+	}
+	middleware.JSONResponse(w, http.StatusOK, secrets)
+}
+
+func (h *Handler) createSecret(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Key           string `json:"key"`
+		Name          string `json:"name"`
+		Description   string `json:"description"`
+		Value         string `json:"value"`
+		EnvironmentID string `json:"environment_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		middleware.JSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Key == "" {
+		middleware.JSONError(w, http.StatusBadRequest, "key is required")
+		return
+	}
+	if req.Value == "" {
+		middleware.JSONError(w, http.StatusBadRequest, "value is required")
+		return
+	}
+
+	encrypted, err := crypto.Encrypt(req.Value, h.secretsKey)
+	if err != nil {
+		middleware.JSONError(w, http.StatusInternalServerError, "encryption failed")
+		return
+	}
+
+	secret := &models.Secret{
+		ID:             uuid.New().String(),
+		Key:            req.Key,
+		Name:           req.Name,
+		Description:    req.Description,
+		EncryptedValue: encrypted,
+		EnvironmentID:  req.EnvironmentID,
+	}
+	if err := h.store.CreateSecret(secret); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			middleware.JSONError(w, http.StatusConflict, "secret key already exists")
+			return
+		}
+		middleware.JSONError(w, http.StatusInternalServerError, "failed to create secret")
+		return
+	}
+	h.audit(auth.ActorFromContext(r.Context()), "CREATE", "secret", secret.ID, secret.Key)
+	// Return without the value
+	middleware.JSONResponse(w, http.StatusCreated, map[string]any{
+		"id":             secret.ID,
+		"key":            secret.Key,
+		"name":           secret.Name,
+		"description":    secret.Description,
+		"environment_id":  secret.EnvironmentID,
+		"created_at":     secret.CreatedAt,
+	})
+}
+
+func (h *Handler) getSecret(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	secret, err := h.store.GetSecret(id)
+	if err != nil || secret == nil {
+		middleware.JSONError(w, http.StatusNotFound, "secret not found")
+		return
+	}
+	// Decrypt value for admin view
+	decrypted, err := crypto.Decrypt(secret.EncryptedValue, h.secretsKey)
+	if err != nil {
+		middleware.JSONError(w, http.StatusInternalServerError, "decryption failed")
+		return
+	}
+	middleware.JSONResponse(w, http.StatusOK, map[string]any{
+		"id":            secret.ID,
+		"key":           secret.Key,
+		"name":          secret.Name,
+		"description":   secret.Description,
+		"value":         decrypted,
+		"environment_id": secret.EnvironmentID,
+		"created_at":    secret.CreatedAt,
+		"updated_at":    secret.UpdatedAt,
+	})
+}
+
+func (h *Handler) updateSecret(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	existing, err := h.store.GetSecret(id)
+	if err != nil || existing == nil {
+		middleware.JSONError(w, http.StatusNotFound, "secret not found")
+		return
+	}
+	var req struct {
+		Key         string `json:"key"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Value       string `json:"value"`
+		EnvironmentID string `json:"environment_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		middleware.JSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	existing.Key = req.Key
+	existing.Name = req.Name
+	existing.Description = req.Description
+	existing.EnvironmentID = req.EnvironmentID
+
+	// Only re-encrypt if a new value is provided
+	if req.Value != "" {
+		encrypted, err := crypto.Encrypt(req.Value, h.secretsKey)
+		if err != nil {
+			middleware.JSONError(w, http.StatusInternalServerError, "encryption failed")
+			return
+		}
+		existing.EncryptedValue = encrypted
+	}
+
+	if err := h.store.UpdateSecret(existing); err != nil {
+		middleware.JSONError(w, http.StatusInternalServerError, "failed to update secret")
+		return
+	}
+	h.audit(auth.ActorFromContext(r.Context()), "UPDATE", "secret", id, existing.Key)
+	middleware.JSONResponse(w, http.StatusOK, map[string]any{
+		"id":            existing.ID,
+		"key":           existing.Key,
+		"name":          existing.Name,
+		"description":   existing.Description,
+		"environment_id": existing.EnvironmentID,
+		"updated_at":    existing.UpdatedAt,
+	})
+}
+
+func (h *Handler) deleteSecret(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := h.store.DeleteSecret(id); err != nil {
+		middleware.JSONError(w, http.StatusInternalServerError, "failed to delete secret")
+		return
+	}
+	h.audit(auth.ActorFromContext(r.Context()), "DELETE", "secret", id, "")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) resolveSecret(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	secret, err := h.store.GetSecretByKey(key)
+	if err != nil || secret == nil {
+		middleware.JSONResponse(w, http.StatusNotFound, map[string]any{
+			"errorCode":   "SECRET_NOT_FOUND",
+			"errorMessage": "secret not found",
+		})
+		return
+	}
+	decrypted, err := crypto.Decrypt(secret.EncryptedValue, h.secretsKey)
+	if err != nil {
+		middleware.JSONError(w, http.StatusInternalServerError, "decryption failed")
+		return
+	}
+	h.audit(auth.ActorFromContext(r.Context()), "RESOLVE", "secret", secret.ID, secret.Key)
+	middleware.JSONResponse(w, http.StatusOK, map[string]any{
+		"key":   secret.Key,
+		"value": decrypted,
+	})
 }

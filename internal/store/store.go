@@ -97,6 +97,16 @@ func (s *Store) migrate() error {
 			name TEXT NOT NULL,
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
+		`CREATE TABLE IF NOT EXISTS secrets (
+			id TEXT PRIMARY KEY,
+			key TEXT UNIQUE NOT NULL,
+			name TEXT NOT NULL,
+			description TEXT DEFAULT '',
+			encrypted_value TEXT NOT NULL,
+			environment_id TEXT DEFAULT '',
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_flags_key ON flags(key)`,
 		`CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp DESC)`,
@@ -480,4 +490,66 @@ func boolToInt(b bool) int {
 
 func generateID() string {
 	return fmt.Sprintf("%d", time.Now().UnixNano())
+}
+
+// --- Secrets ---
+
+func (s *Store) CreateSecret(secret *models.Secret) error {
+	_, err := s.db.Exec(`INSERT INTO secrets (id, key, name, description, encrypted_value, environment_id) VALUES (?, ?, ?, ?, ?, ?)`,
+		secret.ID, secret.Key, secret.Name, secret.Description, secret.EncryptedValue, secret.EnvironmentID)
+	return err
+}
+
+func (s *Store) ListSecrets() ([]models.Secret, error) {
+	rows, err := s.db.Query(`SELECT id, key, name, description, environment_id, created_at, updated_at FROM secrets ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var secrets []models.Secret
+	for rows.Next() {
+		var sec models.Secret
+		if err := rows.Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EnvironmentID, &sec.CreatedAt, &sec.UpdatedAt); err != nil {
+			return nil, err
+		}
+		secrets = append(secrets, sec)
+	}
+	return secrets, nil
+}
+
+func (s *Store) GetSecret(id string) (*models.Secret, error) {
+	var sec models.Secret
+	err := s.db.QueryRow(`SELECT id, key, name, description, encrypted_value, environment_id, created_at, updated_at FROM secrets WHERE id = ?`, id).
+		Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &sec.EnvironmentID, &sec.CreatedAt, &sec.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &sec, nil
+}
+
+func (s *Store) GetSecretByKey(key string) (*models.Secret, error) {
+	var sec models.Secret
+	err := s.db.QueryRow(`SELECT id, key, name, description, encrypted_value, environment_id, created_at, updated_at FROM secrets WHERE key = ?`, key).
+		Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &sec.EnvironmentID, &sec.CreatedAt, &sec.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &sec, nil
+}
+
+func (s *Store) UpdateSecret(secret *models.Secret) error {
+	_, err := s.db.Exec(`UPDATE secrets SET key=?, name=?, description=?, encrypted_value=?, environment_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		secret.Key, secret.Name, secret.Description, secret.EncryptedValue, secret.EnvironmentID, secret.ID)
+	return err
+}
+
+func (s *Store) DeleteSecret(id string) error {
+	_, err := s.db.Exec(`DELETE FROM secrets WHERE id = ?`, id)
+	return err
 }

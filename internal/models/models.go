@@ -119,3 +119,16 @@ type User struct {
 	Email string `json:"email"`
 	Name  string `json:"name"`
 }
+
+// Secret represents an encrypted configuration secret (e.g., API tokens, passwords).
+// The value is encrypted at rest with AES-256-GCM and only decrypted on read.
+type Secret struct {
+	ID            string    `json:"id"`
+	Key           string    `json:"key"`
+	Name          string    `json:"name"`
+	Description   string    `json:"description"`
+	EncryptedValue string   `json:"-"` // Never serialized to JSON
+	EnvironmentID string    `json:"environment_id,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
