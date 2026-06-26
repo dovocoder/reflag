@@ -1,0 +1,23 @@
+# Build artifacts
+web/dist/
+web/node_modules/
+reflag
+reflag.db
+reflag.db-*
+
+# Go
+/vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local

@@ -1,0 +1,483 @@
+package store
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/dovocoder/reflag/internal/models"
+
+	_ "modernc.org/sqlite"
+)
+
+// Store wraps the SQLite database for all persistence operations.
+type Store struct {
+	db *sql.DB
+}
+
+// New opens the SQLite database and runs migrations.
+func New(dbPath string) (*Store, error) {
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(on)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	db.SetMaxOpenConns(1) // SQLite concurrent write safety
+	s := &Store{db: db}
+	if err := s.migrate(); err != nil {
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	return s, nil
+}
+
+func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) migrate() error {
+	migrations := []string{
+		`CREATE TABLE IF NOT EXISTS environments (
+			id TEXT PRIMARY KEY,
+			key TEXT UNIQUE NOT NULL,
+			name TEXT NOT NULL,
+			description TEXT DEFAULT '',
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS flags (
+			id TEXT PRIMARY KEY,
+			key TEXT UNIQUE NOT NULL,
+			name TEXT NOT NULL,
+			description TEXT DEFAULT '',
+			type TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 0,
+			data TEXT NOT NULL DEFAULT '{}',
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS flag_configs (
+			id TEXT PRIMARY KEY,
+			flag_id TEXT NOT NULL REFERENCES flags(id) ON DELETE CASCADE,
+			environment_id TEXT NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+			enabled INTEGER NOT NULL DEFAULT 0,
+			data TEXT NOT NULL DEFAULT '{}',
+			UNIQUE(flag_id, environment_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS segments (
+			id TEXT PRIMARY KEY,
+			key TEXT UNIQUE NOT NULL,
+			name TEXT NOT NULL,
+			description TEXT DEFAULT '',
+			conditions TEXT NOT NULL DEFAULT '[]',
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS api_keys (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			key_hash TEXT UNIQUE NOT NULL,
+			key_prefix TEXT NOT NULL,
+			environment_id TEXT REFERENCES environments(id) ON DELETE SET NULL,
+			scopes TEXT NOT NULL DEFAULT '[]',
+			last_used_at DATETIME,
+			expires_at DATETIME,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			revoked INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS audit_log (
+			id TEXT PRIMARY KEY,
+			actor TEXT NOT NULL,
+			action TEXT NOT NULL,
+			resource TEXT NOT NULL,
+			resource_id TEXT NOT NULL DEFAULT '',
+			details TEXT DEFAULT '',
+			timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS users (
+			id TEXT PRIMARY KEY,
+			email TEXT UNIQUE NOT NULL,
+			name TEXT NOT NULL,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_flags_key ON flags(key)`,
+		`CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_flag_configs_env ON flag_configs(environment_id)`,
+	}
+	for _, m := range migrations {
+		if _, err := s.db.Exec(m); err != nil {
+			return fmt.Errorf("migration step: %w", err)
+		}
+	}
+	return nil
+}
+
+// --- Environments ---
+
+func (s *Store) CreateEnvironment(env *models.Environment) error {
+	_, err := s.db.Exec(`INSERT INTO environments (id, key, name, description) VALUES (?, ?, ?, ?)`,
+		env.ID, env.Key, env.Name, env.Description)
+	return err
+}
+
+func (s *Store) ListEnvironments() ([]models.Environment, error) {
+	rows, err := s.db.Query(`SELECT id, key, name, description, created_at, updated_at FROM environments ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var envs []models.Environment
+	for rows.Next() {
+		var e models.Environment
+		if err := rows.Scan(&e.ID, &e.Key, &e.Name, &e.Description, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			return nil, err
+		}
+		envs = append(envs, e)
+	}
+	return envs, nil
+}
+
+func (s *Store) GetEnvironment(id string) (*models.Environment, error) {
+	var e models.Environment
+	err := s.db.QueryRow(`SELECT id, key, name, description, created_at, updated_at FROM environments WHERE id = ?`, id).
+		Scan(&e.ID, &e.Key, &e.Name, &e.Description, &e.CreatedAt, &e.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &e, err
+}
+
+func (s *Store) GetEnvironmentByKey(key string) (*models.Environment, error) {
+	var e models.Environment
+	err := s.db.QueryRow(`SELECT id, key, name, description, created_at, updated_at FROM environments WHERE key = ?`, key).
+		Scan(&e.ID, &e.Key, &e.Name, &e.Description, &e.CreatedAt, &e.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &e, err
+}
+
+func (s *Store) DeleteEnvironment(id string) error {
+	_, err := s.db.Exec(`DELETE FROM environments WHERE id = ?`, id)
+	return err
+}
+
+// --- Flags ---
+
+func (s *Store) CreateFlag(flag *models.Flag) error {
+	data, err := json.Marshal(flagData{
+		Variations:    flag.Variations,
+		Targeting:     flag.Targeting,
+		DefaultRule:  flag.DefaultRule,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT INTO flags (id, key, name, description, type, enabled, data) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		flag.ID, flag.Key, flag.Name, flag.Description, flag.Type, boolToInt(flag.Enabled), string(data))
+	return err
+}
+
+func (s *Store) ListFlags() ([]models.Flag, error) {
+	rows, err := s.db.Query(`SELECT id, key, name, description, type, enabled, data, created_at, updated_at FROM flags ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var flags []models.Flag
+	for rows.Next() {
+		f, err := scanFlag(rows)
+		if err != nil {
+			return nil, err
+		}
+		flags = append(flags, *f)
+	}
+	return flags, nil
+}
+
+func (s *Store) GetFlag(id string) (*models.Flag, error) {
+	row := s.db.QueryRow(`SELECT id, key, name, description, type, enabled, data, created_at, updated_at FROM flags WHERE id = ?`, id)
+	return scanFlag(row)
+}
+
+func (s *Store) GetFlagByKey(key string) (*models.Flag, error) {
+	row := s.db.QueryRow(`SELECT id, key, name, description, type, enabled, data, created_at, updated_at FROM flags WHERE key = ?`, key)
+	return scanFlag(row)
+}
+
+func (s *Store) UpdateFlag(flag *models.Flag) error {
+	data, err := json.Marshal(flagData{
+		Variations:   flag.Variations,
+		Targeting:    flag.Targeting,
+		DefaultRule:  flag.DefaultRule,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE flags SET key=?, name=?, description=?, type=?, enabled=?, data=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		flag.Key, flag.Name, flag.Description, flag.Type, boolToInt(flag.Enabled), string(data), flag.ID)
+	return err
+}
+
+func (s *Store) DeleteFlag(id string) error {
+	_, err := s.db.Exec(`DELETE FROM flags WHERE id = ?`, id)
+	return err
+}
+
+// --- Flag Configs (per-environment overrides) ---
+
+func (s *Store) GetFlagConfig(flagID, envID string) (*models.Flag, error) {
+	var f models.Flag
+	var dataStr string
+	var enabled int
+	err := s.db.QueryRow(`SELECT f.id, f.key, f.name, f.description, f.type, fc.enabled, fc.data, f.created_at, f.updated_at
+		FROM flags f JOIN flag_configs fc ON fc.flag_id = f.id WHERE fc.flag_id = ? AND fc.environment_id = ?`, flagID, envID).
+		Scan(&f.ID, &f.Key, &f.Name, &f.Description, &f.Type, &enabled, &dataStr, &f.CreatedAt, &f.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	f.Enabled = enabled == 1
+	var fd flagData
+	if err := json.Unmarshal([]byte(dataStr), &fd); err != nil {
+		return nil, err
+	}
+	f.Variations = fd.Variations
+	f.Targeting = fd.Targeting
+	f.DefaultRule = fd.DefaultRule
+	return &f, nil
+}
+
+func (s *Store) UpsertFlagConfig(flagID, envID string, enabled bool, data json.RawMessage) error {
+	// Try update first
+	res, err := s.db.Exec(`UPDATE flag_configs SET enabled=?, data=?, updated_at=CURRENT_TIMESTAMP WHERE flag_id=? AND environment_id=?`,
+		boolToInt(enabled), string(data), flagID, envID)
+	if err != nil {
+		return err
+	}
+	rows, _ := res.RowsAffected()
+	if rows > 0 {
+		return nil
+	}
+	// Insert new
+	id := generateID()
+	_, err = s.db.Exec(`INSERT INTO flag_configs (id, flag_id, environment_id, enabled, data) VALUES (?, ?, ?, ?, ?)`,
+		id, flagID, envID, boolToInt(enabled), string(data))
+	return err
+}
+
+// --- Segments ---
+
+func (s *Store) CreateSegment(seg *models.Segment) error {
+	conditions, err := json.Marshal(seg.Conditions)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT INTO segments (id, key, name, description, conditions) VALUES (?, ?, ?, ?, ?)`,
+		seg.ID, seg.Key, seg.Name, seg.Description, string(conditions))
+	return err
+}
+
+func (s *Store) ListSegments() ([]models.Segment, error) {
+	rows, err := s.db.Query(`SELECT id, key, name, description, conditions, created_at, updated_at FROM segments ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var segs []models.Segment
+	for rows.Next() {
+		var s models.Segment
+		var conditionsStr string
+		if err := rows.Scan(&s.ID, &s.Key, &s.Name, &s.Description, &conditionsStr, &s.CreatedAt, &s.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(conditionsStr), &s.Conditions); err != nil {
+			return nil, err
+		}
+		segs = append(segs, s)
+	}
+	return segs, nil
+}
+
+func (s *Store) DeleteSegment(id string) error {
+	_, err := s.db.Exec(`DELETE FROM segments WHERE id = ?`, id)
+	return err
+}
+
+// --- API Keys ---
+
+func (s *Store) CreateAPIKey(key *models.APIKey) error {
+	scopes, err := json.Marshal(key.Scopes)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT INTO api_keys (id, name, key_hash, key_prefix, environment_id, scopes, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		key.ID, key.Name, key.KeyHash, key.KeyPrefix, key.EnvironmentID, string(scopes), key.ExpiresAt)
+	return err
+}
+
+func (s *Store) ListAPIKeys() ([]models.APIKey, error) {
+	rows, err := s.db.Query(`SELECT id, name, key_prefix, environment_id, scopes, last_used_at, expires_at, created_at, revoked FROM api_keys ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []models.APIKey
+	for rows.Next() {
+		var k models.APIKey
+		var scopesStr string
+		var lastUsed sql.NullTime
+		var expires sql.NullTime
+		var envID sql.NullString
+		if err := rows.Scan(&k.ID, &k.Name, &k.KeyPrefix, &envID, &scopesStr, &lastUsed, &expires, &k.CreatedAt, &k.Revoked); err != nil {
+			return nil, err
+		}
+		if envID.Valid {
+			k.EnvironmentID = envID.String
+		}
+		if lastUsed.Valid {
+			k.LastUsedAt = &lastUsed.Time
+		}
+		if expires.Valid {
+			k.ExpiresAt = &expires.Time
+		}
+		if err := json.Unmarshal([]byte(scopesStr), &k.Scopes); err != nil {
+			return nil, err
+		}
+		keys = append(keys, k)
+	}
+	return keys, nil
+}
+
+func (s *Store) GetAPIKeyByHash(hash string) (*models.APIKey, error) {
+	var k models.APIKey
+	var scopesStr string
+	var lastUsed sql.NullTime
+	var expires sql.NullTime
+	var envID sql.NullString
+	err := s.db.QueryRow(`SELECT id, name, key_prefix, environment_id, scopes, last_used_at, expires_at, created_at, revoked FROM api_keys WHERE key_hash = ?`, hash).
+		Scan(&k.ID, &k.Name, &k.KeyPrefix, &envID, &scopesStr, &lastUsed, &expires, &k.CreatedAt, &k.Revoked)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if envID.Valid {
+		k.EnvironmentID = envID.String
+	}
+	if lastUsed.Valid {
+		k.LastUsedAt = &lastUsed.Time
+	}
+	if expires.Valid {
+		k.ExpiresAt = &expires.Time
+	}
+	if err := json.Unmarshal([]byte(scopesStr), &k.Scopes); err != nil {
+		return nil, err
+	}
+	return &k, nil
+}
+
+func (s *Store) UpdateAPIKeyLastUsed(id string) error {
+	_, err := s.db.Exec(`UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?`, id)
+	return err
+}
+
+func (s *Store) RevokeAPIKey(id string) error {
+	_, err := s.db.Exec(`UPDATE api_keys SET revoked = 1 WHERE id = ?`, id)
+	return err
+}
+
+// --- Audit Log ---
+
+func (s *Store) CreateAuditEntry(entry *models.AuditLogEntry) error {
+	_, err := s.db.Exec(`INSERT INTO audit_log (id, actor, action, resource, resource_id, details) VALUES (?, ?, ?, ?, ?, ?)`,
+		entry.ID, entry.Actor, entry.Action, entry.Resource, entry.ResourceID, entry.Details)
+	return err
+}
+
+func (s *Store) ListAuditEntries(limit, offset int) ([]models.AuditLogEntry, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.db.Query(`SELECT id, actor, action, resource, resource_id, details, timestamp FROM audit_log ORDER BY timestamp DESC LIMIT ? OFFSET ?`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var entries []models.AuditLogEntry
+	for rows.Next() {
+		var e models.AuditLogEntry
+		if err := rows.Scan(&e.ID, &e.Actor, &e.Action, &e.Resource, &e.ResourceID, &e.Details, &e.Timestamp); err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
+}
+
+// --- Users ---
+
+func (s *Store) GetOrCreateUser(email, name string) (*models.User, error) {
+	// Try to find existing
+	var u models.User
+	err := s.db.QueryRow(`SELECT id, email, name FROM users WHERE email = ?`, email).Scan(&u.ID, &u.Email, &u.Name)
+	if err == nil {
+		return &u, nil
+	}
+	if err != sql.ErrNoRows {
+		return nil, err
+	}
+	u.ID = generateID()
+	u.Email = email
+	u.Name = name
+	_, err = s.db.Exec(`INSERT INTO users (id, email, name) VALUES (?, ?, ?)`, u.ID, u.Email, u.Name)
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+// --- Helpers ---
+
+type flagData struct {
+	Variations   []models.Variation     `json:"variations"`
+	Targeting    []models.TargetingRule `json:"targeting"`
+	DefaultRule  *models.DefaultRule     `json:"default_rule,omitempty"`
+}
+
+type scanner interface {
+	Scan(dest ...any) error
+}
+
+func scanFlag(row scanner) (*models.Flag, error) {
+	var f models.Flag
+	var dataStr string
+	var enabled int
+	if err := row.Scan(&f.ID, &f.Key, &f.Name, &f.Description, &f.Type, &enabled, &dataStr, &f.CreatedAt, &f.UpdatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	f.Enabled = enabled == 1
+	var fd flagData
+	if err := json.Unmarshal([]byte(dataStr), &fd); err != nil {
+		return nil, err
+	}
+	f.Variations = fd.Variations
+	f.Targeting = fd.Targeting
+	f.DefaultRule = fd.DefaultRule
+	return &f, nil
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func generateID() string {
+	return fmt.Sprintf("%d", time.Now().UnixNano())
+}
