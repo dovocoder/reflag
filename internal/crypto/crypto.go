@@ -91,9 +91,9 @@ func hkdfSHA256(salt, ikm []byte, length int) []byte {
 	info := []byte("reflag-key-derivation")
 	var okm []byte
 	var t []byte
-	counter := byte(1)
+	counter := 1 // use int to avoid byte overflow on large outputs
 	for len(okm) < length {
-		data := append(append(t, info...), counter)
+		data := append(append(t, info...), byte(counter))
 		t = hmacSHA256(prk, data)
 		okm = append(okm, t...)
 		counter++

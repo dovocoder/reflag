@@ -118,7 +118,7 @@ func (h *Handler) oidcStart(w http.ResponseWriter, r *http.Request) {
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to generate state")
 		return
 	}
-	authURL, err := h.auth.GetAuthorizationURL(state)
+	authURL, verifier, err := h.auth.GetAuthorizationURL(state)
 	if err != nil {
 		middleware.JSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -129,6 +129,16 @@ func (h *Handler) oidcStart(w http.ResponseWriter, r *http.Request) {
 		Value:     state,
 		Path:     "/",
 		MaxAge:   600, // 10 minutes
+		HttpOnly:  true,
+		SameSite:  http.SameSiteLaxMode,
+		Secure:    r.TLS != nil,
+	})
+	// Set SameSite=Lax cookie for PKCE verifier
+	http.SetCookie(w, &http.Cookie{
+		Name:     "reflag_pkce_verifier",
+		Value:     verifier,
+		Path:     "/",
+		MaxAge:   600,
 		HttpOnly:  true,
 		SameSite:  http.SameSiteLaxMode,
 		Secure:    r.TLS != nil,
@@ -163,14 +173,25 @@ func (h *Handler) oidcCallback(w http.ResponseWriter, r *http.Request) {
 		middleware.JSONError(w, http.StatusForbidden, "invalid state")
 		return
 	}
-	// Clear the state cookie
+	// Clear the state and PKCE cookies
 	http.SetCookie(w, &http.Cookie{
 		Name:   "reflag_oidc_state",
 		Value:  "",
 		Path:   "/",
 		MaxAge: -1,
 	})
-	user, token, err := h.auth.ExchangeCode(req.Code)
+	http.SetCookie(w, &http.Cookie{
+		Name:   "reflag_pkce_verifier",
+		Value:  "",
+		Path:   "/",
+		MaxAge: -1,
+	})
+	// Retrieve PKCE verifier from cookie
+	var codeVerifier string
+	if pkceCookie, err := r.Cookie("reflag_pkce_verifier"); err == nil {
+		codeVerifier = pkceCookie.Value
+	}
+	user, token, err := h.auth.ExchangeCode(req.Code, codeVerifier)
 	if err != nil {
 		h.audit("unknown", "LOGIN_FAILED", "user", "", "OIDC exchange failed")
 		middleware.JSONError(w, http.StatusUnauthorized, err.Error())
@@ -382,6 +403,9 @@ func (h *Handler) createFlag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	flag.ID = uuid.New().String()
+	if flag.Version == 0 {
+		flag.Version = 1
+	}
 	if err := h.store.CreateFlag(&flag); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			middleware.JSONError(w, http.StatusConflict, "flag key already exists")
@@ -414,9 +438,22 @@ func (h *Handler) updateFlag(w http.ResponseWriter, r *http.Request) {
 	var flag models.Flag
 	if err := json.NewDecoder(r.Body).Decode(&flag); err != nil {
 		middleware.JSONError(w, http.StatusBadRequest, "invalid request body")
-	 return
+		return
+	}
+	if flag.Key == "" {
+		flag.Key = existing.Key
+	}
+	if !isValidFlagKey(flag.Key) {
+		middleware.JSONError(w, http.StatusBadRequest, "key must be alphanumeric with dashes/underscores, max 128 chars")
+		return
+	}
+	if len(flag.Name) > 256 {
+		middleware.JSONError(w, http.StatusBadRequest, "name too long (max 256 chars)")
+		return
 	}
 	flag.ID = id
+	// Auto-increment version (never allow user-controlled version regression)
+	flag.Version = existing.Version + 1
 	if err := h.store.UpdateFlag(&flag); err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to update flag")
 		return
@@ -457,6 +494,10 @@ func (h *Handler) createEnvironment(w http.ResponseWriter, r *http.Request) {
 	}
 	if env.Key == "" {
 		middleware.JSONError(w, http.StatusBadRequest, "key is required")
+		return
+	}
+	if !isValidKey(env.Key) {
+		middleware.JSONError(w, http.StatusBadRequest, "key must be alphanumeric with dashes/underscores, max 128 chars")
 		return
 	}
 	env.ID = uuid.New().String()
@@ -500,6 +541,10 @@ func (h *Handler) createSegment(w http.ResponseWriter, r *http.Request) {
 	}
 	if seg.Key == "" {
 		middleware.JSONError(w, http.StatusBadRequest, "key is required")
+		return
+	}
+	if !isValidKey(seg.Key) {
+		middleware.JSONError(w, http.StatusBadRequest, "key must be alphanumeric with dashes/underscores, max 128 chars")
 		return
 	}
 	seg.ID = uuid.New().String()
@@ -656,6 +701,10 @@ func (h *Handler) createOrg(w http.ResponseWriter, r *http.Request) {
 		middleware.JSONError(w, http.StatusBadRequest, "name and slug are required")
 		return
 	}
+	if !isValidKey(org.Slug) {
+		middleware.JSONError(w, http.StatusBadRequest, "slug must be alphanumeric with dashes/underscores, max 128 chars")
+		return
+	}
 	org.ID = uuid.New().String()
 	if err := h.store.CreateOrg(&org); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
@@ -801,6 +850,21 @@ func isValidFlagKey(key string) bool {
 	return true
 }
 
+// isValidKey validates a general-purpose identifier (env key, segment key, org slug, secret key).
+// Allows alphanumeric, dashes, underscores, dots — max 128 chars. No path traversal chars.
+func isValidKey(key string) bool {
+	if len(key) == 0 || len(key) > 128 {
+		return false
+	}
+	for _, c := range key {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
 // isValidRole checks if a role is one of the allowed values.
 var validRoles = map[string]bool{
 	"owner":  true,
@@ -895,6 +959,10 @@ func (h *Handler) createSecret(w http.ResponseWriter, r *http.Request) {
 		middleware.JSONError(w, http.StatusBadRequest, "key is required")
 		return
 	}
+	if !isValidKey(req.Key) {
+		middleware.JSONError(w, http.StatusBadRequest, "key must be alphanumeric with dashes/underscores, max 128 chars")
+		return
+	}
 	if req.Value == "" {
 		middleware.JSONError(w, http.StatusBadRequest, "value is required")
 		return
@@ -983,6 +1051,11 @@ func (h *Handler) updateSecret(w http.ResponseWriter, r *http.Request) {
 	existing.Description = req.Description
 	existing.EnvironmentID = req.EnvironmentID
 
+	if req.Key != "" && !isValidKey(req.Key) {
+		middleware.JSONError(w, http.StatusBadRequest, "key must be alphanumeric with dashes/underscores, max 128 chars")
+		return
+	}
+
 	// Only re-encrypt if a new value is provided
 	if req.Value != "" {
 		encrypted, err := crypto.Encrypt(req.Value, h.secretsKey)
@@ -1022,6 +1095,15 @@ func (h *Handler) resolveSecret(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	secret, err := h.store.GetSecretByKey(key)
 	if err != nil || secret == nil {
+		middleware.JSONResponse(w, http.StatusNotFound, map[string]any{
+			"errorCode":    "SECRET_NOT_FOUND",
+			"errorMessage": "secret not found",
+		})
+		return
+	}
+	// Scope by API key's environment if set
+	apiKey := auth.APIKeyFromContext(r.Context())
+	if apiKey != nil && apiKey.EnvironmentID != "" && secret.EnvironmentID != apiKey.EnvironmentID {
 		middleware.JSONResponse(w, http.StatusNotFound, map[string]any{
 			"errorCode":    "SECRET_NOT_FOUND",
 			"errorMessage": "secret not found",

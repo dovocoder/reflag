@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -269,22 +270,45 @@ func (a *AuthService) GetDiscovery() (*OIDCDiscovery, error) {
 	return &d, nil
 }
 
-func (a *AuthService) GetAuthorizationURL(state string) (string, error) {
+func (a *AuthService) GetAuthorizationURL(state string) (string, string, error) {
 	d, err := a.GetDiscovery()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
+	// PKCE: generate code_verifier and derive code_challenge
+	verifier, err := generateCodeVerifier()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to generate PKCE verifier: %w", err)
+	}
+	challenge := deriveCodeChallenge(verifier)
 	params := url.Values{
-		"response_type": {"code"},
-		"client_id":     {a.oidcClientID},
-		"redirect_uri":  {a.oidcRedirect},
-		"scope":         {"openid email profile"},
-		"state":         {state},
+		"response_type":         {"code"},
+		"client_id":             {a.oidcClientID},
+		"redirect_uri":          {a.oidcRedirect},
+		"scope":                 {"openid email profile"},
+		"state":                 {state},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
 	}
-	return d.AuthorizationEndpoint + "?" + params.Encode(), nil
+	return d.AuthorizationEndpoint + "?" + params.Encode(), verifier, nil
 }
 
-func (a *AuthService) ExchangeCode(code string) (*models.User, string, error) {
+// generateCodeVerifier creates a random PKCE code verifier (43-128 chars, RFC 7636).
+func generateCodeVerifier() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// deriveCodeChallenge computes the S256 code challenge from a verifier (RFC 7636).
+func deriveCodeChallenge(verifier string) string {
+	h := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(h[:])
+}
+
+func (a *AuthService) ExchangeCode(code, codeVerifier string) (*models.User, string, error) {
 	d, err := a.GetDiscovery()
 	if err != nil {
 		return nil, "", err
@@ -296,6 +320,9 @@ func (a *AuthService) ExchangeCode(code string) (*models.User, string, error) {
 		"redirect_uri":  {a.oidcRedirect},
 		"client_id":     {a.oidcClientID},
 		"client_secret": {a.oidcClientSec},
+	}
+	if codeVerifier != "" {
+		data.Set("code_verifier", codeVerifier)
 	}
 	resp, err := a.httpClient.PostForm(d.TokenEndpoint, data)
 	if err != nil {
