@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -157,6 +158,7 @@ func (h *Handler) evaluateFlag(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	detail := openfeature.Evaluate(flag, req.EnvKey, req.Context)
+	detail = h.resolveSecretRefs(flag, detail)
 	middleware.JSONResponse(w, http.StatusOK, detail)
 }
 
@@ -185,6 +187,7 @@ func (h *Handler) evaluateFlagByKey(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	detail := openfeature.Evaluate(flag, req.EnvKey, req.Context)
+	detail = h.resolveSecretRefs(flag, detail)
 	middleware.JSONResponse(w, http.StatusOK, detail)
 }
 
@@ -473,6 +476,48 @@ func (h *Handler) audit(actor, action, resource, resourceID, details string) {
 		Details:    details,
 	}
 	_ = h.store.CreateAuditEntry(entry)
+}
+
+// resolveSecretRefs checks if the evaluated value is a secret reference
+// ({"$secret": "KEY"}) and resolves it to the decrypted secret value.
+// Non-secret values are returned as-is.
+func (h *Handler) resolveSecretRefs(_ *models.Flag, detail openfeature.ResolutionDetail) openfeature.ResolutionDetail {
+	if detail.Value == nil || detail.Reason == openfeature.ReasonError {
+		return detail
+	}
+	// Check if the value looks like a secret reference
+	m, ok := detail.Value.(map[string]any)
+	if !ok {
+		return detail // not a secret ref, return as-is
+	}
+	secretKey, hasRef := m["$secret"]
+	if !hasRef {
+		return detail // regular object, not a secret ref
+	}
+	keyStr, ok := secretKey.(string)
+	if !ok {
+		detail.Reason = openfeature.ReasonError
+		detail.ErrorCode = "SECRET_RESOLUTION_FAILED"
+		detail.ErrorMsg = "$secret value must be a string"
+		return detail
+	}
+	// Look up and decrypt the secret
+	secret, err := h.store.GetSecretByKey(keyStr)
+	if err != nil || secret == nil {
+		detail.Reason = openfeature.ReasonError
+		detail.ErrorCode = "SECRET_NOT_FOUND"
+		detail.ErrorMsg = fmt.Sprintf("secret %q not found", keyStr)
+		return detail
+	}
+	decrypted, err := crypto.Decrypt(secret.EncryptedValue, h.secretsKey)
+	if err != nil {
+		detail.Reason = openfeature.ReasonError
+		detail.ErrorCode = "SECRET_RESOLUTION_FAILED"
+		detail.ErrorMsg = fmt.Sprintf("failed to decrypt secret %q", keyStr)
+		return detail
+	}
+	detail.Value = decrypted
+	return detail
 }
 
 // --- Secrets ---

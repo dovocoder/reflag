@@ -12,10 +12,14 @@ import (
 	"github.com/dovocoder/reflag/internal/models"
 )
 
+// SecretResolver is a function that resolves a secret key to its decrypted value.
+// If the secret doesn't exist or decryption fails, it returns ("", error).
+type SecretResolver func(key string) (string, error)
+
 // ResolutionContext provides evaluation-time metadata.
 type ResolutionContext struct {
-	TargetingKey string            `json:"targetingKey,omitempty"`
-	Attributes   map[string]any    `json:"attributes,omitempty"`
+	TargetingKey string         `json:"targetingKey,omitempty"`
+	Attributes   map[string]any `json:"attributes,omitempty"`
 }
 
 // ResolutionDetail holds the result of flag evaluation.
@@ -85,6 +89,52 @@ func Evaluate(flag *models.Flag, envKey string, ctx ResolutionContext) Resolutio
 		ErrorCode: "FLAG_NOT_CONFIGURED",
 		ErrorMsg:  "flag has no default rule configured",
 	}
+}
+
+// EvaluateWithSecrets works like Evaluate but resolves any variation values
+// that are secret references ({"$secret": "KEY"}) to their decrypted values.
+// If resolver is nil, secret references are returned as-is (the JSON object).
+func EvaluateWithSecrets(flag *models.Flag, envKey string, ctx ResolutionContext, resolver SecretResolver) ResolutionDetail {
+	detail := Evaluate(flag, envKey, ctx)
+	if resolver == nil {
+		return detail
+	}
+	// Check if the resolved value is a secret reference
+	if detail.Value == nil {
+		return detail
+	}
+	resolvedValue, err := resolveSecretValue(detail.Value, resolver)
+	if err != nil {
+		detail.Reason = ReasonError
+		detail.ErrorCode = "SECRET_RESOLUTION_FAILED"
+		detail.ErrorMsg = err.Error()
+		return detail
+	}
+	detail.Value = resolvedValue
+	return detail
+}
+
+// resolveSecretValue checks if a value is a secret reference and resolves it.
+// A secret reference is an object with a "$secret" key: {"$secret": "DATABASE_URL"}.
+// Non-secret values are returned as-is.
+func resolveSecretValue(val any, resolver SecretResolver) (any, error) {
+	m, ok := val.(map[string]any)
+	if !ok {
+		return val, nil
+	}
+	secretKey, hasRef := m["$secret"]
+	if !hasRef {
+		return val, nil // regular object, not a secret ref
+	}
+	keyStr, ok := secretKey.(string)
+	if !ok {
+		return nil, fmt.Errorf("$secret value must be a string, got %T", secretKey)
+	}
+	decrypted, err := resolver(keyStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve secret %q: %w", keyStr, err)
+	}
+	return decrypted, nil
 }
 
 const (

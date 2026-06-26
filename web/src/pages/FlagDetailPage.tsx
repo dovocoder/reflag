@@ -3,7 +3,7 @@ import { api, type Flag } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
 import { Input, Label, Textarea, Select } from "@/components/ui/form";
-import { ArrowLeft, Save, Trash2, Plus, X } from "lucide-react";
+import { ArrowLeft, Save, Trash2, Plus, X, Lock } from "lucide-react";
 import { useState, useEffect } from "react";
 
 export function FlagDetailPage({ id, onNavigate }: { id: string; onNavigate: (path: string) => void }) {
@@ -16,6 +16,11 @@ export function FlagDetailPage({ id, onNavigate }: { id: string; onNavigate: (pa
     enabled: !isNew,
   });
 
+  const { data: secrets } = useQuery({
+    queryKey: ["secrets"],
+    queryFn: api.listSecrets,
+  });
+
   const [form, setForm] = useState<Partial<Flag>>({
     key: "",
     name: "",
@@ -26,6 +31,8 @@ export function FlagDetailPage({ id, onNavigate }: { id: string; onNavigate: (pa
     targeting_rules: [],
     default_rule: { variation_id: "false-var" },
   });
+
+  const isSecretType = form.type === "secret";
 
   useEffect(() => {
     if (flag) {
@@ -106,6 +113,7 @@ export function FlagDetailPage({ id, onNavigate }: { id: string; onNavigate: (pa
                 <option value="string">String</option>
                 <option value="number">Number</option>
                 <option value="object">Object (JSON)</option>
+                <option value="secret">Secret (encrypted)</option>
               </Select>
             </div>
             <div className="space-y-2">
@@ -131,7 +139,10 @@ export function FlagDetailPage({ id, onNavigate }: { id: string; onNavigate: (pa
           <CardDescription>The possible values this flag can resolve to.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
-          {(form.variations || []).map((v, i) => (
+          {(form.variations || []).map((v, i) => {
+            const secretRef = typeof v.value === "object" && v.value !== null && "$secret" in (v.value as Record<string, unknown>)
+              ? (v.value as Record<string, string>)["$secret"] : "";
+            return (
             <div key={v.id} className="flex items-center gap-2">
               <Input
                 value={v.label}
@@ -143,20 +154,40 @@ export function FlagDetailPage({ id, onNavigate }: { id: string; onNavigate: (pa
                 placeholder="Variation label"
                 className="flex-1"
               />
-              <Input
-                value={typeof v.value === "object" ? JSON.stringify(v.value) : String(v.value)}
-                onChange={(e) => {
-                  const variations = [...(form.variations || [])];
-                  let val: unknown = e.target.value;
-                  if (form.type === "boolean") val = e.target.value === "true";
-                  else if (form.type === "number") val = parseFloat(e.target.value) || 0;
-                  else if (form.type === "object") try { val = JSON.parse(e.target.value); } catch { val = e.target.value; }
-                  variations[i] = { ...v, value: val };
-                  setForm({ ...form, variations });
-                }}
-                placeholder="Value"
-                className="flex-1"
-              />
+              {isSecretType ? (
+                <div className="flex-1 flex items-center gap-1">
+                  <Lock className="size-3 text-[var(--color-muted-foreground)] shrink-0" />
+                  <Select
+                    value={secretRef}
+                    onChange={(e) => {
+                      const variations = [...(form.variations || [])];
+                      variations[i] = { ...v, value: { "$secret": e.target.value } };
+                      setForm({ ...form, variations });
+                    }}
+                    className="flex-1"
+                  >
+                    <option value="">Select secret...</option>
+                    {secrets?.map((s) => (
+                      <option key={s.id} value={s.key}>{s.key}</option>
+                    ))}
+                  </Select>
+                </div>
+              ) : (
+                <Input
+                  value={typeof v.value === "object" ? JSON.stringify(v.value) : String(v.value)}
+                  onChange={(e) => {
+                    const variations = [...(form.variations || [])];
+                    let val: unknown = e.target.value;
+                    if (form.type === "boolean") val = e.target.value === "true";
+                    else if (form.type === "number") val = parseFloat(e.target.value) || 0;
+                    else if (form.type === "object") try { val = JSON.parse(e.target.value); } catch { val = e.target.value; }
+                    variations[i] = { ...v, value: val };
+                    setForm({ ...form, variations });
+                  }}
+                  placeholder="Value"
+                  className="flex-1"
+                />
+              )}
               <Button
                 variant="ghost"
                 size="icon"
@@ -168,13 +199,18 @@ export function FlagDetailPage({ id, onNavigate }: { id: string; onNavigate: (pa
                 <X className="size-4" />
               </Button>
             </div>
-          ))}
+            );
+          })}
           <Button
             variant="outline"
             size="sm"
             onClick={() => {
               const variations = [...(form.variations || [])];
-              variations.push({ id: `var-${Date.now()}`, label: "", value: form.type === "boolean" ? false : "" });
+              if (isSecretType) {
+                variations.push({ id: `var-${Date.now()}`, label: "", value: { "$secret": "" } });
+              } else {
+                variations.push({ id: `var-${Date.now()}`, label: "", value: form.type === "boolean" ? false : "" });
+              }
               setForm({ ...form, variations });
             }}
           >

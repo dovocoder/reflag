@@ -6,6 +6,7 @@ A secure, self-hosted feature flag and remote configuration service with full [O
 
 - **Full OpenFeature Spec**: Boolean, string, number, and object flag types with targeting rules, percentage rollouts, and default rules
 - **Secrets Management**: Encrypted configuration secrets (API tokens, passwords) with AES-256-GCM encryption at rest
+- **Secret Feature Flags**: Flags whose variation values reference stored secrets (`{"$secret": "KEY"}`), resolved to decrypted values at evaluation time — use targeting rules to serve different secrets per user/environment
 - **Dual Authentication**: OIDC (admin UI) + API keys (programmatic SDK access)
 - **Environments**: Per-environment flag overrides (production, staging, etc.)
 - **Segments**: Reusable targeting segments for audience management
@@ -107,7 +108,7 @@ All admin endpoints require a JWT (from OIDC login):
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/secrets/DATABASE_URL/resolve \
-  -H "X-API-Key: *** \
+  -H "X-API-Key: rfk_..."
 ```
 
 Response:
@@ -115,6 +116,53 @@ Response:
 {
   "key": "DATABASE_URL",
   "value": "postgres://user:***@host:5432/db"
+}
+```
+
+### Evaluate a Secret Feature Flag
+
+Secret feature flags use `{"$secret": "KEY"}` as variation values. At evaluation time,
+the system resolves the secret reference to its decrypted value.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/flags/evaluate \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: rfk_..." \
+  -d '{
+    "flagKey": "payment-key",
+    "environment": "production",
+    "context": {
+      "targetingKey": "user-123",
+      "attributes": { "email": "dev@internal.com" }
+    }
+  }'
+```
+
+Response (internal user gets the production Stripe key):
+```json
+{
+  "value": "sk_live_...",
+  "variant": "Production Key",
+  "reason": "TARGETING_MATCH"
+}
+```
+
+Non-internal users get the default variation (e.g., a test key):
+```json
+{
+  "value": "sk_test_...",
+  "variant": "Test Key",
+  "reason": "DEFAULT"
+}
+```
+
+If the referenced secret doesn't exist, evaluation returns an error:
+```json
+{
+  "value": null,
+  "reason": "ERROR",
+  "errorCode": "SECRET_NOT_FOUND",
+  "errorMessage": "secret \"MISSING\" not found"
 }
 ```
 

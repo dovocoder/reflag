@@ -49,7 +49,7 @@ export interface Flag {
   key: string;
   name: string;
   description: string;
-  type: "boolean" | "string" | "number" | "object";
+  type: "boolean" | "string" | "number" | "object" | "secret";
   enabled: boolean;
   variations: Variation[];
   targeting_rules: TargetingRule[];
