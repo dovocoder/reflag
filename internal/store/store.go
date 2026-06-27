@@ -96,6 +96,7 @@ func (s *Store) migrate() error {
 			id TEXT PRIMARY KEY,
 			email TEXT UNIQUE NOT NULL,
 			name TEXT NOT NULL,
+			role TEXT NOT NULL DEFAULT 'member',
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE TABLE IF NOT EXISTS secrets (
@@ -155,6 +156,8 @@ func (s *Store) migrate() error {
 	if !hasVersion {
 		s.db.Exec(`ALTER TABLE flags ADD COLUMN version INTEGER NOT NULL DEFAULT 1`)
 	}
+	// Add role column to users table for existing DBs
+	s.db.Exec(`ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'member'`)
 	return nil
 }
 
@@ -477,7 +480,7 @@ func (s *Store) ListAuditEntries(limit, offset int) ([]models.AuditLogEntry, err
 func (s *Store) GetOrCreateUser(email, name string) (*models.User, error) {
 	// Try to find existing
 	var u models.User
-	err := s.db.QueryRow(`SELECT id, email, name FROM users WHERE email = ?`, email).Scan(&u.ID, &u.Email, &u.Name)
+	err := s.db.QueryRow(`SELECT id, email, name, role FROM users WHERE email = ?`, email).Scan(&u.ID, &u.Email, &u.Name, &u.Role)
 	if err == nil {
 		return &u, nil
 	}
@@ -487,7 +490,8 @@ func (s *Store) GetOrCreateUser(email, name string) (*models.User, error) {
 	u.ID = generateID()
 	u.Email = email
 	u.Name = name
-	_, err = s.db.Exec(`INSERT INTO users (id, email, name) VALUES (?, ?, ?)`, u.ID, u.Email, u.Name)
+	u.Role = "member"
+	_, err = s.db.Exec(`INSERT INTO users (id, email, name, role) VALUES (?, ?, ?, ?)`, u.ID, u.Email, u.Name, u.Role)
 	if err != nil {
 		return nil, err
 	}
@@ -547,7 +551,7 @@ func (s *Store) CreateSecret(secret *models.Secret) error {
 }
 
 func (s *Store) ListSecrets() ([]models.Secret, error) {
-	rows, err := s.db.Query(`SELECT id, key, name, description, environment_id, created_at, updated_at FROM secrets ORDER BY created_at DESC`)
+	rows, err := s.db.Query(`SELECT id, key, name, description, encrypted_value, environment_id, created_at, updated_at FROM secrets ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -555,7 +559,7 @@ func (s *Store) ListSecrets() ([]models.Secret, error) {
 	var secrets []models.Secret
 	for rows.Next() {
 		var sec models.Secret
-		if err := rows.Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EnvironmentID, &sec.CreatedAt, &sec.UpdatedAt); err != nil {
+		if err := rows.Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &sec.EnvironmentID, &sec.CreatedAt, &sec.UpdatedAt); err != nil {
 			return nil, err
 		}
 		secrets = append(secrets, sec)

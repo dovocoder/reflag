@@ -38,6 +38,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, loginLimiter *middleware.Ra
 	mux.Handle("POST /api/auth/login", middleware.RateLimitMiddleware(loginLimiter, http.HandlerFunc(h.adminLogin)))
 	mux.HandleFunc("POST /api/auth/oidc/start", h.oidcStart)
 	mux.Handle("POST /api/auth/oidc/callback", middleware.RateLimitMiddleware(loginLimiter, http.HandlerFunc(h.oidcCallback)))
+	mux.HandleFunc("POST /api/auth/logout", h.logout)
 
 	// Evaluation routes (API key or JWT) — OpenFeature HTTP API
 	evalMux := http.NewServeMux()
@@ -62,7 +63,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, loginLimiter *middleware.Ra
 	resolveMux.HandleFunc("POST /api/v1/secrets/resolve", h.resolveAllSecrets)
 	mux.Handle("/api/v1/secrets/", h.auth.APIKeyMiddleware(resolveMux))
 
-	// Admin routes (JWT only)
+	// Admin routes (JWT only) — require admin or owner role for all management operations
+	// OIDC-provisioned users get "member" role and can only access /api/v1/ evaluation + resolve endpoints
 	adminMux := http.NewServeMux()
 	adminMux.HandleFunc("GET /api/flags", h.listFlags)
 	adminMux.HandleFunc("POST /api/flags", h.createFlag)
@@ -100,8 +102,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, loginLimiter *middleware.Ra
 	adminMux.HandleFunc("PUT /api/secrets/{id}", h.updateSecret)
 	adminMux.HandleFunc("DELETE /api/secrets/{id}", h.deleteSecret)
 
-	// All admin routes require JWT
-	mux.Handle("/api/", h.auth.JWTMiddleware(adminMux))
+	// All admin routes require JWT + admin/owner role
+	mux.Handle("/api/", h.auth.JWTMiddleware(h.auth.RequireRole("admin", "owner")(adminMux)))
 }
 
 // --- Health ---
@@ -124,6 +126,7 @@ func (h *Handler) oidcStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Set SameSite=Lax cookie for state validation
+	isTLS := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 	http.SetCookie(w, &http.Cookie{
 		Name:     "reflag_oidc_state",
 		Value:     state,
@@ -131,7 +134,7 @@ func (h *Handler) oidcStart(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   600, // 10 minutes
 		HttpOnly:  true,
 		SameSite:  http.SameSiteLaxMode,
-		Secure:    r.TLS != nil,
+		Secure:    isTLS,
 	})
 	// Set SameSite=Lax cookie for PKCE verifier
 	http.SetCookie(w, &http.Cookie{
@@ -141,7 +144,7 @@ func (h *Handler) oidcStart(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   600,
 		HttpOnly:  true,
 		SameSite:  http.SameSiteLaxMode,
-		Secure:    r.TLS != nil,
+		Secure:    isTLS,
 	})
 	middleware.JSONResponse(w, http.StatusOK, map[string]string{
 		"authorization_url": authURL,
@@ -198,6 +201,17 @@ func (h *Handler) oidcCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.audit(user.Email, "LOGIN", "user", user.ID, "OIDC login")
+	// Set JWT as HttpOnly cookie for browser-based XSS protection
+	isTLS := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+	http.SetCookie(w, &http.Cookie{
+		Name:     "reflag_token",
+		Value:     token,
+		Path:     "/",
+		MaxAge:   86400, // 24 hours
+		HttpOnly:  true,
+		SameSite:  http.SameSiteLaxMode,
+		Secure:    isTLS,
+	})
 	middleware.JSONResponse(w, http.StatusOK, map[string]any{
 		"token": token,
 		"user":  user,
@@ -227,7 +241,15 @@ func (h *Handler) evaluateFlagByKey(w http.ResponseWriter, r *http.Request) {
 		Environment  string                 `json:"environment,omitempty"`
 		Context      openfeature.EvaluationContext `json:"context,omitempty"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		middleware.JSONResponse(w, http.StatusOK, openfeature.ResolutionDetail{
+			Value:        nil,
+			Reason:       openfeature.ReasonError,
+			ErrorCode:    openfeature.ErrParseError,
+			ErrorMessage: "invalid request body",
+		})
+		return
+	}
 	detail := h.evaluateFlagInternal(w, r, openfeature.EvaluationRequest{
 		FlagKey:      flagKey,
 		DefaultValue: req.DefaultValue,
@@ -667,14 +689,40 @@ func (h *Handler) adminLogin(w http.ResponseWriter, r *http.Request) {
 	user, token, err := h.auth.LoginAdmin(req.Email, req.Password)
 	if err != nil {
 		h.audit(req.Email, "LOGIN_FAILED", "user", "admin", "invalid credentials")
-		middleware.JSONError(w, http.StatusUnauthorized, err.Error())
+		// Still return generic error to prevent email enumeration
+		middleware.JSONError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
 	h.audit(user.Email, "LOGIN", "user", user.ID, "admin login")
+	// Set JWT as HttpOnly cookie for browser-based XSS protection
+	isTLS := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+	http.SetCookie(w, &http.Cookie{
+		Name:     "reflag_token",
+		Value:     token,
+		Path:     "/",
+		MaxAge:   86400, // 24 hours
+		HttpOnly:  true,
+		SameSite:  http.SameSiteLaxMode,
+		Secure:    isTLS,
+	})
 	middleware.JSONResponse(w, http.StatusOK, map[string]any{
 		"token": token,
 		"user":  user,
 	})
+}
+
+func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
+	isTLS := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+	http.SetCookie(w, &http.Cookie{
+		Name:     "reflag_token",
+		Value:     "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly:  true,
+		SameSite:  http.SameSiteLaxMode,
+		Secure:    isTLS,
+	})
+	middleware.JSONResponse(w, http.StatusOK, map[string]string{"status": "logged out"})
 }
 
 // --- Organizations ---
@@ -754,6 +802,15 @@ func (h *Handler) listOrgMembers(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) addOrgMember(w http.ResponseWriter, r *http.Request) {
 	orgID := r.PathValue("id")
+	// Check that the authenticated user is admin/owner of this org (or hardcoded admin)
+	user := auth.UserFromContext(r.Context())
+	if user != nil && user.ID != "admin" {
+		role, err := h.store.GetUserOrgRole(user.ID, orgID)
+		if err != nil || (role != "owner" && role != "admin") {
+			middleware.JSONError(w, http.StatusForbidden, "insufficient permissions — must be org admin or owner")
+			return
+		}
+	}
 	var req struct {
 		Email string `json:"email"`
 		Role  string `json:"role"`
@@ -801,6 +858,28 @@ func (h *Handler) addOrgMember(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) updateOrgMemberRole(w http.ResponseWriter, r *http.Request) {
 	memberID := r.PathValue("memberId")
+	// Check that the authenticated user is admin/owner of the member's org (or hardcoded admin)
+	user := auth.UserFromContext(r.Context())
+	if user != nil && user.ID != "admin" {
+		// Fetch the member to find the orgID, then check role
+		members, err := h.store.ListOrgMembers("")
+		if err == nil {
+			var orgID string
+			for _, m := range members {
+				if m.ID == memberID {
+					orgID = m.OrgID
+					break
+				}
+			}
+			if orgID != "" {
+				role, err := h.store.GetUserOrgRole(user.ID, orgID)
+				if err != nil || (role != "owner" && role != "admin") {
+					middleware.JSONError(w, http.StatusForbidden, "insufficient permissions — must be org admin or owner")
+					return
+				}
+			}
+		}
+	}
 	var req struct {
 		Role string `json:"role"`
 	}
@@ -826,6 +905,27 @@ func (h *Handler) updateOrgMemberRole(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) removeOrgMember(w http.ResponseWriter, r *http.Request) {
 	memberID := r.PathValue("memberId")
+	// Check that the authenticated user is admin/owner of the member's org (or hardcoded admin)
+	user := auth.UserFromContext(r.Context())
+	if user != nil && user.ID != "admin" {
+		members, err := h.store.ListOrgMembers("")
+		if err == nil {
+			var orgID string
+			for _, m := range members {
+				if m.ID == memberID {
+					orgID = m.OrgID
+					break
+				}
+			}
+			if orgID != "" {
+				role, err := h.store.GetUserOrgRole(user.ID, orgID)
+				if err != nil || (role != "owner" && role != "admin") {
+					middleware.JSONError(w, http.StatusForbidden, "insufficient permissions — must be org admin or owner")
+					return
+				}
+			}
+		}
+	}
 	if err := h.store.RemoveOrgMember(memberID); err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to remove member")
 		return
@@ -1124,6 +1224,11 @@ func (h *Handler) resolveSecret(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) resolveAllSecrets(w http.ResponseWriter, r *http.Request) {
 	apiKey := auth.APIKeyFromContext(r.Context())
+	// Default-deny: require environment scoping on API keys
+	if apiKey == nil || apiKey.EnvironmentID == "" {
+		middleware.JSONError(w, http.StatusForbidden, "API key must be scoped to an environment")
+		return
+	}
 	secrets, err := h.store.ListSecrets()
 	if err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "database error")
@@ -1131,19 +1236,18 @@ func (h *Handler) resolveAllSecrets(w http.ResponseWriter, r *http.Request) {
 	}
 	result := make(map[string]string)
 	for _, s := range secrets {
-		// Scope secrets by API key's environment ID if set
-		if apiKey != nil && apiKey.EnvironmentID != "" {
-			if s.EnvironmentID != apiKey.EnvironmentID {
-				continue
-			}
+		// Scope secrets by API key's environment ID
+		if s.EnvironmentID != apiKey.EnvironmentID {
+			continue
 		}
 		decrypted, err := crypto.Decrypt(s.EncryptedValue, h.secretsKey)
 		if err != nil {
 			continue
 		}
 		result[s.Key] = decrypted
+		// Audit individual secret resolution
+		h.audit(auth.ActorFromContext(r.Context()), "RESOLVE", "secret", s.ID, s.Key)
 	}
-	h.audit(auth.ActorFromContext(r.Context()), "RESOLVE_ALL", "secret", "", "bulk resolve")
 	h.writeEncrypted(w, r, result)
 }
 

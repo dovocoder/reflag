@@ -17,6 +17,19 @@ func JSONResponse(w http.ResponseWriter, code int, data any) {
 	_ = json.NewEncoder(w).Encode(data)
 }
 
+// RecoveryMiddleware recovers from panics in handlers, preventing server crashes.
+// Logs the panic and returns a 500 without leaking internal details.
+func RecoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				JSONError(w, http.StatusInternalServerError, "internal server error")
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
 // JSONError writes a JSON error response.
 func JSONError(w http.ResponseWriter, code int, message string) {
 	JSONResponse(w, code, map[string]string{"error": message})
@@ -260,7 +273,9 @@ func CSRFMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		// API key requests bypass CSRF (they're not browser-based)
-		if r.Header.Get("X-API-Key") != "" {
+		// Only bypass for API-key-specific paths (/api/v1/) to prevent
+		// CSRF bypass on JWT-authenticated admin routes via dummy X-API-Key header
+		if r.Header.Get("X-API-Key") != "" && strings.HasPrefix(r.URL.Path, "/api/v1/") {
 			next.ServeHTTP(w, r)
 			return
 		}

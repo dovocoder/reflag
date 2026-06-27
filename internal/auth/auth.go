@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -11,8 +12,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +24,7 @@ import (
 	"github.com/dovocoder/reflag/internal/models"
 	"github.com/dovocoder/reflag/internal/store"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -109,6 +113,7 @@ func (a *AuthService) GenerateJWT(user *models.User) (string, error) {
 		Name:  user.Name,
 		Role:  role,
 		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        uuid.New().String(),
 			Subject:   user.ID,
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
@@ -174,7 +179,12 @@ func GenerateAPIKey() (rawKey string, hash string, prefix string, err error) {
 	}
 	rawKey = "rfk_" + hex.EncodeToString(bytes)
 	hash = HashAPIKey(rawKey)
-	prefix = rawKey[:12] + "..."
+	// Show only last 4 chars as display prefix to minimize key material exposure
+	if len(rawKey) > 8 {
+		prefix = "rfk_..." + rawKey[len(rawKey)-4:]
+	} else {
+		prefix = "rfk_..."
+	}
 	return rawKey, hash, prefix, nil
 }
 
@@ -187,16 +197,16 @@ func (a *AuthService) ValidateAPIKey(key string) (*models.APIKey, error) {
 	hash := HashAPIKey(key)
 	apiKey, err := a.store.GetAPIKeyByHash(hash)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid API key")
 	}
 	if apiKey == nil {
 		return nil, fmt.Errorf("invalid API key")
 	}
 	if apiKey.Revoked {
-		return nil, fmt.Errorf("API key revoked")
+		return nil, fmt.Errorf("invalid API key")
 	}
 	if apiKey.ExpiresAt != nil && time.Now().After(*apiKey.ExpiresAt) {
-		return nil, fmt.Errorf("API key expired")
+		return nil, fmt.Errorf("invalid API key")
 	}
 	// Update last used (fire and forget)
 	go a.store.UpdateAPIKeyLastUsed(apiKey.ID)
@@ -331,7 +341,7 @@ func (a *AuthService) ExchangeCode(code, codeVerifier string) (*models.User, str
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB max
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("token exchange returned %d: %s", resp.StatusCode, string(body))
+		return nil, "", fmt.Errorf("token exchange failed (status %d)", resp.StatusCode)
 	}
 
 	var tokenResp struct {
@@ -340,6 +350,13 @@ func (a *AuthService) ExchangeCode(code, codeVerifier string) (*models.User, str
 	}
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
 		return nil, "", err
+	}
+
+	// Verify the ID token if present — this is the cryptographic proof of identity
+	if tokenResp.IDToken != "" {
+		if err := a.verifyIDToken(tokenResp.IDToken); err != nil {
+			return nil, "", fmt.Errorf("ID token verification failed: %w", err)
+		}
 	}
 
 	// Fetch userinfo
@@ -418,15 +435,20 @@ func RawAPIKeyFromContext(ctx context.Context) string {
 	return ""
 }
 
-// JWTMiddleware validates a JWT from the Authorization header.
+// JWTMiddleware validates a JWT from the Authorization header or reflag_token cookie.
 func (a *AuthService) JWTMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var tokenStr string
 		authHeader := r.Header.Get("Authorization")
-		if !strings.HasPrefix(authHeader, "Bearer ") {
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			tokenStr = strings.TrimPrefix(authHeader, "Bearer ")
+		} else if cookie, err := r.Cookie("reflag_token"); err == nil && cookie.Value != "" {
+			tokenStr = cookie.Value
+		}
+		if tokenStr == "" {
 			http.Error(w, `{"error":"missing or invalid authorization header"}`, http.StatusUnauthorized)
 			return
 		}
-		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 		// Don't treat API keys as JWTs
 		if strings.HasPrefix(tokenStr, "rfk_") {
 			http.Error(w, `{"error":"API key not accepted for admin endpoints"}`, http.StatusUnauthorized)
@@ -511,17 +533,142 @@ func (a *AuthService) AnyAuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// ValidateState verifies an OIDC state token using HMAC-SHA256.
-// State = random_hex + "." + HMAC(random_hex, jwtSecret)
-// This prevents CSRF in the OIDC flow without server-side session storage.
+// GenerateState generates a random OIDC state token with HMAC signature and timestamp.
+// Format: nonce.timestamp.signature
+// State is valid for max 10 minutes (600 seconds) after generation.
+func (a *AuthService) GenerateState() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	nonce := hex.EncodeToString(b)
+	ts := time.Now().Unix()
+	sig := a.signState(nonce + "." + strconv.FormatInt(ts, 10))
+	return nonce + "." + strconv.FormatInt(ts, 10) + "." + sig, nil
+}
+
+// ValidateState verifies an OIDC state token using HMAC-SHA256 and checks expiry.
+// State = nonce.timestamp.signature — valid for max 10 minutes.
 func (a *AuthService) ValidateState(state string) bool {
-	parts := strings.SplitN(state, ".", 2)
-	if len(parts) != 2 {
+	parts := strings.SplitN(state, ".", 3)
+	if len(parts) != 3 {
 		return false
 	}
-	nonce, sig := parts[0], parts[1]
-	expectedSig := a.signState(nonce)
-	return subtle.ConstantTimeCompare([]byte(sig), []byte(expectedSig)) == 1
+	nonce, tsStr, sig := parts[0], parts[1], parts[2]
+	expectedSig := a.signState(nonce + "." + tsStr)
+	if subtle.ConstantTimeCompare([]byte(sig), []byte(expectedSig)) != 1 {
+		return false
+	}
+	// Check timestamp — state expires after 10 minutes
+	ts, err := strconv.ParseInt(tsStr, 10, 64)
+	if err != nil {
+		return false
+	}
+	if time.Now().Unix()-ts > 600 {
+		return false
+	}
+	return true
+}
+
+// verifyIDToken verifies the OIDC ID token signature and claims.
+// Fetches the JWKS from the issuer's jwks_uri and validates the token.
+func (a *AuthService) verifyIDToken(idToken string) error {
+	d, err := a.GetDiscovery()
+	if err != nil {
+		return fmt.Errorf("discovery failed: %w", err)
+	}
+	// Parse the token without verification first to get the kid
+	parsed, _, err := jwt.NewParser().ParseUnverified(idToken, &jwt.RegisteredClaims{})
+	if err != nil {
+		return fmt.Errorf("failed to parse ID token: %w", err)
+	}
+	// Validate issuer and audience
+	claims, ok := parsed.Claims.(*jwt.RegisteredClaims)
+	if !ok {
+		return fmt.Errorf("unexpected claims type in ID token")
+	}
+	if claims.Issuer != a.oidcIssuer {
+		return fmt.Errorf("ID token issuer mismatch: expected %s, got %s", a.oidcIssuer, claims.Issuer)
+	}
+	if len(claims.Audience) > 0 && claims.Audience[0] != a.oidcClientID {
+		return fmt.Errorf("ID token audience mismatch")
+	}
+	if claims.ExpiresAt != nil && time.Now().After(claims.ExpiresAt.Time) {
+		return fmt.Errorf("ID token expired")
+	}
+	// Fetch JWKS and verify signature
+	jwksResp, err := a.httpClient.Get(d.JWKSURI)
+	if err != nil {
+		return fmt.Errorf("failed to fetch JWKS: %w", err)
+	}
+	defer jwksResp.Body.Close()
+	jwksBody, err := io.ReadAll(io.LimitReader(jwksResp.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("failed to read JWKS: %w", err)
+	}
+	var jwks struct {
+		Keys []struct {
+			Kty string `json:"kty"`
+			Kid string `json:"kid"`
+			Use string `json:"use"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.Unmarshal(jwksBody, &jwks); err != nil {
+		return fmt.Errorf("failed to parse JWKS: %w", err)
+	}
+	// Find the signing key by kid
+	kid := ""
+	if header, ok := parsed.Header["kid"]; ok {
+		if kidStr, ok := header.(string); ok {
+			kid = kidStr
+		}
+	}
+	var signingKey *struct {
+		Kty string `json:"kty"`
+		Kid string `json:"kid"`
+		Use string `json:"use"`
+		N   string `json:"n"`
+		E   string `json:"e"`
+	}
+	for i := range jwks.Keys {
+		if jwks.Keys[i].Kid == kid || kid == "" {
+			signingKey = &jwks.Keys[i]
+			break
+		}
+	}
+	if signingKey == nil {
+		return fmt.Errorf("signing key not found in JWKS for kid %s", kid)
+	}
+	// Verify the token signature using the JWKS key
+	_, err = jwt.Parse(idToken, func(t *jwt.Token) (any, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		// Construct RSA public key from n and e
+		nBytes, err := base64.RawURLEncoding.DecodeString(signingKey.N)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode n: %w", err)
+		}
+		eBytes, err := base64.RawURLEncoding.DecodeString(signingKey.E)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode e: %w", err)
+		}
+		e := 0
+		for _, b := range eBytes {
+			e = e<<8 + int(b)
+		}
+		pubKey := &rsa.PublicKey{
+			N: new(big.Int).SetBytes(nBytes),
+			E: e,
+		}
+		return pubKey, nil
+	}, jwt.WithIssuer(a.oidcIssuer), jwt.WithAudience(a.oidcClientID))
+	if err != nil {
+		return fmt.Errorf("ID token signature verification failed: %w", err)
+	}
+	return nil
 }
 
 func (a *AuthService) signState(nonce string) string {
@@ -529,14 +676,4 @@ func (a *AuthService) signState(nonce string) string {
 	h.Write([]byte("oidc-state:"))
 	h.Write([]byte(nonce))
 	return hex.EncodeToString(h.Sum(nil))
-}
-
-// GenerateState generates a random OIDC state token with HMAC signature.
-func (a *AuthService) GenerateState() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	nonce := hex.EncodeToString(b)
-	return nonce + "." + a.signState(nonce), nil
 }

@@ -122,11 +122,26 @@ Example:
 	}
 
 	// Build env for child: current env + injected secrets
+	// Validate env var names to prevent injection of dangerous variables
+	dangerousNames := map[string]bool{
+		"PATH": true, "LD_PRELOAD": true, "LD_LIBRARY_PATH": true,
+		"DYLD_INSERT_LIBRARIES": true, "NODE_OPTIONS": true, "PYTHONPATH": true,
+		"PERL5OPT": true, "RUBYOPT": true, "JAVA_TOOL_OPTIONS": true,
+	}
 	childEnv := os.Environ()
 	for k, v := range secrets {
 		envKey := k
 		if prefix != "" {
 			envKey = prefix + k
+		}
+		// Validate env var name: uppercase letters, digits, underscores only
+		if !isValidEnvName(envKey) {
+			fmt.Fprintf(os.Stderr, "error: invalid env var name %q (must match [A-Z_][A-Z0-9_]*)\n", envKey)
+			os.Exit(1)
+		}
+		if dangerousNames[envKey] {
+			fmt.Fprintf(os.Stderr, "error: refusing to inject dangerous env var %q\n", envKey)
+			os.Exit(1)
 		}
 		childEnv = append(childEnv, fmt.Sprintf("%s=%s", envKey, v))
 	}
@@ -188,15 +203,10 @@ Example:
 
 // --- Transport encryption (mirrors server-side crypto/transport.go) ---
 
-// deriveTransportKey derives an AES-256 key from a partial API key.
-// Uses the first 16 characters of the API key (after the rfk_ prefix)
-// as key material, hashed with SHA-256.
+// deriveTransportKey derives an AES-256 key from the full raw API key.
+// Uses SHA-256 with a domain separator to produce a 32-byte key.
 func deriveTransportKey(rawAPIKey string) []byte {
-	keyMaterial := rawAPIKey
-	if len(keyMaterial) > 20 {
-		keyMaterial = keyMaterial[4:20]
-	}
-	hash := sha256.Sum256([]byte("reflag-transport:" + keyMaterial))
+	hash := sha256.Sum256([]byte("reflag-transport:" + rawAPIKey))
 	return hash[:]
 }
 
@@ -290,6 +300,23 @@ func fetchSecrets(apiURL, apiKey string) (map[string]string, error) {
 
 // --- Output scrubbing ---
 
+// isValidEnvName validates that an env var name matches [A-Z_][A-Z0-9_]*
+func isValidEnvName(name string) bool {
+	if len(name) == 0 {
+		return false
+	}
+	for i, c := range name {
+		if c == '_' || (c >= 'A' && c <= 'Z') {
+			continue
+		}
+		if i > 0 && (c >= '0' && c <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 // scrubCopy reads from src, replaces all secret values with "***", and writes to dst.
 func scrubCopy(dst io.Writer, src io.Reader, secrets []string) {
 	if len(secrets) == 0 {
@@ -331,6 +358,7 @@ func scrubCopy(dst io.Writer, src io.Reader, secrets []string) {
 }
 
 // scrubBytes replaces all occurrences of secret values in data with "***".
+// Also scrubs base64-encoded and URL-encoded variants of secrets.
 func scrubBytes(data []byte, secrets []string) []byte {
 	result := data
 	for _, s := range secrets {
@@ -338,6 +366,11 @@ func scrubBytes(data []byte, secrets []string) []byte {
 			continue
 		}
 		result = bytes.ReplaceAll(result, []byte(s), []byte("***"))
+		// Also scrub base64-encoded variant
+		b64 := base64.StdEncoding.EncodeToString([]byte(s))
+		if b64 != s && len(b64) > 3 {
+			result = bytes.ReplaceAll(result, []byte(b64), []byte("***"))
+		}
 	}
 	return result
 }

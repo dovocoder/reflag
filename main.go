@@ -76,8 +76,9 @@ func main() {
 		fileServer.ServeHTTP(w, r)
 	})
 
-	// Build middleware chain: security headers → CORS → rate limit → CSRF → mux
+	// Build middleware chain: security headers → CORS → rate limit → CSRF → recovery → mux
 	var finalHandler http.Handler = mux
+	finalHandler = middleware.RecoveryMiddleware(finalHandler)
 	finalHandler = middleware.MaxBodyMiddleware(finalHandler)
 	finalHandler = middleware.CSRFMiddleware(finalHandler)
 	finalHandler = middleware.RateLimitMiddleware(rateLimiter, finalHandler)

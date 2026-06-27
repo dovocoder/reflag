@@ -11,19 +11,11 @@ import (
 	"io"
 )
 
-// DeriveTransportKey derives an AES-256 key from a partial API key.
-// Uses the first 16 characters of the API key (after the rfk_ prefix)
-// as the key material, hashed with SHA-256.
+// DeriveTransportKey derives an AES-256 key from the full raw API key.
+// Uses SHA-256 with a domain separator to produce a 32-byte key.
 // Both client and server derive the same key independently.
 func DeriveTransportKey(rawAPIKey string) []byte {
-	// Use the first 16 chars of the raw key (after prefix) as key material
-	// This ensures a partial key compromise doesn't reveal the full API key
-	keyMaterial := rawAPIKey
-	if len(keyMaterial) > 20 {
-		// Use chars 4-20 (skip "rfk_", take next 16 chars)
-		keyMaterial = keyMaterial[4:20]
-	}
-	hash := sha256.Sum256([]byte("reflag-transport:" + keyMaterial))
+	hash := sha256.Sum256([]byte("reflag-transport:" + rawAPIKey))
 	return hash[:]
 }
 
