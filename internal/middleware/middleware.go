@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -249,8 +250,10 @@ func RequestLogger(next http.Handler) http.Handler {
 		start := time.Now()
 		rw := &statusWriter{ResponseWriter: w, status: 200}
 		next.ServeHTTP(rw, r)
-		_ = start
-		// In a real app we'd use a structured logger
+		// Skip health check logging to reduce noise
+		if r.URL.Path != "/health" {
+			log.Printf("%s %s %d %s", r.Method, r.URL.Path, rw.status, time.Since(start))
+		}
 	})
 }
 

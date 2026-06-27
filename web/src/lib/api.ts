@@ -1,19 +1,23 @@
 const API_BASE = "/api";
 
-function getToken(): string | null {
-  return localStorage.getItem("reflag_token");
-}
-
-export function setToken(token: string) {
-  localStorage.setItem("reflag_token", token);
-}
+// Token is now stored in an HttpOnly cookie set by the server.
+// The frontend no longer touches localStorage for the JWT.
+// fetch() automatically sends cookies with credentials: 'include'.
 
 export function clearToken() {
-  localStorage.removeItem("reflag_token");
+  // The cookie is cleared by the server's /auth/logout endpoint.
+  // No client-side cleanup needed.
+}
+
+export function setToken(_token: string) {
+  // No-op: token is now set as an HttpOnly cookie by the server.
+  // Kept for backward compatibility with LoginPage.tsx.
 }
 
 export function isAuthenticated(): boolean {
-  return !!getToken();
+  // We can't check the HttpOnly cookie from JS — assume authenticated.
+  // The server will return 401 if not authenticated, redirecting to /login.
+  return true;
 }
 
 async function request<T>(
@@ -24,13 +28,8 @@ async function request<T>(
     "Content-Type": "application/json",
     ...((options.headers as Record<string, string>) || {}),
   };
-  const token = getToken();
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
-  }
-  const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  const res = await fetch(`${API_BASE}${path}`, { ...options, headers, credentials: "include" });
   if (res.status === 401) {
-    clearToken();
     window.location.href = "/login";
     throw new Error("Unauthorized");
   }

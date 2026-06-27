@@ -214,17 +214,14 @@ func (a *AuthService) ValidateAPIKey(key string) (*models.APIKey, error) {
 }
 
 // HasScope checks if the API key has a specific scope.
-// Empty scopes means all access (backward compatibility).
+// Empty scopes means no access (default-deny).
 func HasScope(ctx context.Context, scope string) bool {
-	apiKey := APIKeyFromContext(ctx)
-	if apiKey == nil {
+	apiKey, ok := ctx.Value(apiKeyKey).(*models.APIKey)
+	if !ok || apiKey == nil {
 		return false
 	}
-	if len(apiKey.Scopes) == 0 {
-		return true // no scope restriction
-	}
 	for _, s := range apiKey.Scopes {
-		if s == scope || s == "*" {
+		if s == scope {
 			return true
 		}
 	}
@@ -507,7 +504,7 @@ func (a *AuthService) APIKeyMiddleware(next http.Handler) http.Handler {
 		}
 		apiKey, err := a.ValidateAPIKey(key)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusUnauthorized)
+			http.Error(w, `{"error":"invalid API key"}`, http.StatusUnauthorized)
 			return
 		}
 		ctx := context.WithValue(r.Context(), apiKeyKey, apiKey)
@@ -623,6 +620,12 @@ func (a *AuthService) verifyIDToken(idToken string) error {
 	if header, ok := parsed.Header["kid"]; ok {
 		if kidStr, ok := header.(string); ok {
 			kid = kidStr
+		}
+	}
+	if kid == "" {
+		// R5-16: Reject tokens without kid when multiple keys exist in JWKS
+		if len(jwks.Keys) != 1 {
+			return fmt.Errorf("ID token missing kid and multiple JWKS keys present")
 		}
 	}
 	var signingKey *struct {

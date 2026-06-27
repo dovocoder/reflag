@@ -156,7 +156,7 @@ func EvaluateWithType(flag *models.Flag, envKey string, ctx EvaluationContext, e
 		return detail
 	}
 
-	if !validateType(detail.Value, expectedType) {
+	if !ValidateType(detail.Value, expectedType) {
 		return ResolutionDetail{
 			Value:        nil,
 			Variant:      detail.Variant,
@@ -189,8 +189,8 @@ func EvaluateWithSecrets(flag *models.Flag, envKey string, ctx EvaluationContext
 	return detail
 }
 
-// validateType checks if a value matches the expected OpenFeature flag type.
-func validateType(val any, expectedType models.FlagType) bool {
+// ValidateType checks if a value matches the expected OpenFeature flag type.
+func ValidateType(val any, expectedType models.FlagType) bool {
 	switch expectedType {
 	case models.FlagTypeBoolean:
 		_, ok := val.(bool)
@@ -232,7 +232,7 @@ func resolveSecretValue(val any, resolver SecretResolver) (any, error) {
 	}
 	decrypted, err := resolver(keyStr)
 	if err != nil {
-		return nil, fmt.Errorf("secret %q: %w", keyStr, err)
+		return nil, fmt.Errorf("secret reference resolution failed")
 	}
 	return decrypted, nil
 }
@@ -252,6 +252,9 @@ func matchesAllConditions(conditions []models.Condition, ctx EvaluationContext) 
 }
 
 func matchesCondition(cond models.Condition, ctx EvaluationContext) bool {
+	if cond.Attribute == "" {
+		return false
+	}
 	var attrVal any
 	if cond.Attribute == "targetingKey" {
 		attrVal = ctx.TargetingKey
@@ -260,6 +263,18 @@ func matchesCondition(cond models.Condition, ctx EvaluationContext) bool {
 	}
 	if attrVal == nil {
 		return false
+	}
+	// Reject complex types for string-based operators
+	switch attrVal.(type) {
+	case []any, map[string]any:
+		// Only allow complex types for type-agnostic operators (true/false/empty/not_empty)
+		// For all string operators, complex types are rejected to prevent fmt.Sprintf false matches
+		if cond.Operator != "true" && cond.Operator != "TRUE" &&
+			cond.Operator != "false" && cond.Operator != "FALSE" &&
+			cond.Operator != "empty" && cond.Operator != "EMPTY" &&
+			cond.Operator != "not_empty" && cond.Operator != "NOT_EMPTY" {
+			return false
+		}
 	}
 	attrStr := fmt.Sprintf("%v", attrVal)
 
@@ -358,9 +373,9 @@ func matchesCondition(cond models.Condition, ctx EvaluationContext) bool {
 		}
 		return false
 	case "true", "TRUE":
-		return attrVal == true || attrStr == "true"
+		return attrVal == true
 	case "false", "FALSE":
-		return attrVal == false || attrStr == "false"
+		return attrVal == false
 	case "empty", "EMPTY":
 		return attrStr == ""
 	case "not_empty", "NOT_EMPTY":
@@ -384,11 +399,28 @@ func matchesCondition(cond models.Condition, ctx EvaluationContext) bool {
 // percentageBucket determines which variation a key falls into using
 // deterministic SHA-256 hash-based bucketing (OpenFeature spec compliant).
 func percentageBucket(flagKey, envKey, targetingKey string, percentages map[string]int) string {
+	if len(percentages) == 0 {
+		return ""
+	}
 	variationIDs := make([]string, 0, len(percentages))
 	for id := range percentages {
 		variationIDs = append(variationIDs, id)
 	}
 	sort.Strings(variationIDs)
+
+	// Validate percentages: all must be >= 0 and sum to 100
+	total := 0
+	for _, id := range variationIDs {
+		p := percentages[id]
+		if p < 0 {
+			return variationIDs[0]
+		}
+		total += p
+	}
+	if total != 100 {
+		// Misconfigured rollout — fall back to first variation rather than silently distributing incorrectly
+		return variationIDs[0]
+	}
 
 	hashInput := fmt.Sprintf("%s:%s:%s", flagKey, envKey, targetingKey)
 	h := sha256.Sum256([]byte(hashInput))
@@ -417,6 +449,21 @@ func getVariationValueByID(flag *models.Flag, variationID string) any {
 		}
 	}
 	return nil
+}
+
+// getVariationValueByIDWithErr is like getVariationValueByID but returns an error
+// when the variation value JSON is malformed or the variation ID is not found.
+func getVariationValueByIDWithErr(flag *models.Flag, variationID string) (any, error) {
+	for _, v := range flag.Variations {
+		if v.ID == variationID {
+			var val any
+			if err := json.Unmarshal(v.Value, &val); err != nil {
+				return nil, fmt.Errorf("malformed variation value")
+			}
+			return val, nil
+		}
+	}
+	return nil, fmt.Errorf("variation %q not found", variationID)
 }
 
 func getVariationLabelByID(flag *models.Flag, variationID string) string {

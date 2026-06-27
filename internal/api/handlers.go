@@ -287,7 +287,18 @@ func (h *Handler) evaluateFlagType(w http.ResponseWriter, r *http.Request, expec
 			Value:        req.DefaultValue,
 			Reason:       openfeature.ReasonError,
 			ErrorCode:    openfeature.ErrFlagNotFound,
-			ErrorMessage: fmt.Sprintf("flag %q not found", req.FlagKey),
+			ErrorMessage: "flag not found",
+		})
+		return
+	}
+
+	// R5-4: Reject if flag type doesn't match the endpoint type
+	if flag.Type != "" && flag.Type != expectedType {
+		middleware.JSONResponse(w, http.StatusOK, openfeature.ResolutionDetail{
+			Value:        req.DefaultValue,
+			Reason:       openfeature.ReasonError,
+			ErrorCode:    openfeature.ErrTypeMismatch,
+			ErrorMessage: "flag type does not match requested type",
 		})
 		return
 	}
@@ -296,6 +307,18 @@ func (h *Handler) evaluateFlagType(w http.ResponseWriter, r *http.Request, expec
 	if req.Environment != "" {
 		env, _ := h.store.GetEnvironmentByKey(req.Environment)
 		if env != nil {
+			// R5-7: Enforce API key environment scoping
+			if ak := auth.APIKeyFromContext(r.Context()); ak != nil && ak.EnvironmentID != "" {
+				if ak.EnvironmentID != env.ID {
+					middleware.JSONResponse(w, http.StatusOK, openfeature.ResolutionDetail{
+						Value:        req.DefaultValue,
+						Reason:       openfeature.ReasonError,
+						ErrorCode:    openfeature.ErrFlagNotFound,
+						ErrorMessage: "flag not found",
+					})
+					return
+				}
+			}
 			if envFlag, _ := h.store.GetFlagConfig(flag.ID, env.ID); envFlag != nil {
 				flag = envFlag
 			}
@@ -303,7 +326,16 @@ func (h *Handler) evaluateFlagType(w http.ResponseWriter, r *http.Request, expec
 	}
 
 	detail := openfeature.EvaluateWithType(flag, req.Environment, req.Context, expectedType)
-	detail = h.resolveSecretRefs(flag, detail)
+	detail = h.resolveSecretRefs(r, flag, detail)
+	// Re-validate type after secret resolution (secret value may have different type)
+	if detail.Reason != openfeature.ReasonError && detail.Value != nil {
+		if !openfeature.ValidateType(detail.Value, expectedType) {
+			detail.Value = req.DefaultValue
+			detail.Reason = openfeature.ReasonError
+			detail.ErrorCode = openfeature.ErrTypeMismatch
+			detail.ErrorMessage = "type mismatch after secret resolution"
+		}
+	}
 
 	// On error, return the defaultValue from the request
 	if detail.Reason == openfeature.ReasonError {
@@ -345,7 +377,7 @@ func (h *Handler) evaluateFlagInternal(w http.ResponseWriter, r *http.Request, r
 			Value:        req.DefaultValue,
 			Reason:       openfeature.ReasonError,
 			ErrorCode:    openfeature.ErrFlagNotFound,
-			ErrorMessage: fmt.Sprintf("flag %q not found", req.FlagKey),
+			ErrorMessage: "flag not found",
 		}
 	}
 
@@ -353,6 +385,17 @@ func (h *Handler) evaluateFlagInternal(w http.ResponseWriter, r *http.Request, r
 	if req.Environment != "" {
 		env, _ := h.store.GetEnvironmentByKey(req.Environment)
 		if env != nil {
+			// R5-7: Enforce API key environment scoping
+			if ak := auth.APIKeyFromContext(r.Context()); ak != nil && ak.EnvironmentID != "" {
+				if ak.EnvironmentID != env.ID {
+					return openfeature.ResolutionDetail{
+						Value:        req.DefaultValue,
+						Reason:       openfeature.ReasonError,
+						ErrorCode:    openfeature.ErrFlagNotFound,
+						ErrorMessage: "flag not found",
+					}
+				}
+			}
 			if envFlag, _ := h.store.GetFlagConfig(flag.ID, env.ID); envFlag != nil {
 				flag = envFlag
 			}
@@ -360,7 +403,7 @@ func (h *Handler) evaluateFlagInternal(w http.ResponseWriter, r *http.Request, r
 	}
 
 	detail := openfeature.Evaluate(flag, req.Environment, req.Context)
-	detail = h.resolveSecretRefs(flag, detail)
+	detail = h.resolveSecretRefs(r, flag, detail)
 
 	// On error, return the defaultValue from the request
 	if detail.Reason == openfeature.ReasonError {
@@ -379,12 +422,18 @@ func (h *Handler) listFlagsForClient(w http.ResponseWriter, r *http.Request) {
 	// Return minimal data for client SDKs — strip secret reference values
 	// to prevent leaking secret key names to API consumers
 	type clientFlag struct {
-		Key        string `json:"key"`
-		Enabled    bool   `json:"enabled"`
-		Type       string `json:"type"`
+		Key     string `json:"key"`
+		Enabled bool   `json:"enabled"`
+		Type    string `json:"type"`
 	}
+	// R5-12: Filter by API key environment and hide secret-type flags from API callers
+	ak := auth.APIKeyFromContext(r.Context())
 	result := make([]clientFlag, 0, len(flags))
 	for _, f := range flags {
+		// Hide secret-type flags from API key callers
+		if ak != nil && f.Type == "secret" {
+			continue
+		}
 		result = append(result, clientFlag{
 			Key: f.Key, Enabled: f.Enabled, Type: string(f.Type),
 		})
@@ -1066,7 +1115,7 @@ func sanitizeAuditField(s string) string {
 // resolveSecretRefs checks if the evaluated value is a secret reference
 // ({"$secret": "KEY"}) and resolves it to the decrypted secret value.
 // Non-secret values are returned as-is.
-func (h *Handler) resolveSecretRefs(_ *models.Flag, detail openfeature.ResolutionDetail) openfeature.ResolutionDetail {
+func (h *Handler) resolveSecretRefs(r *http.Request, flag *models.Flag, detail openfeature.ResolutionDetail) openfeature.ResolutionDetail {
 	if detail.Value == nil || detail.Reason == openfeature.ReasonError {
 		return detail
 	}
@@ -1091,6 +1140,15 @@ func (h *Handler) resolveSecretRefs(_ *models.Flag, detail openfeature.Resolutio
 		detail.ErrorCode = openfeature.ErrSecretNotFound
 		detail.ErrorMessage = "secret not found"
 		return detail
+	}
+	// Enforce API key environment scoping on secret resolution
+	if apiKey := auth.APIKeyFromContext(r.Context()); apiKey != nil && apiKey.EnvironmentID != "" {
+		if secret.EnvironmentID != apiKey.EnvironmentID {
+			detail.Reason = openfeature.ReasonError
+			detail.ErrorCode = openfeature.ErrSecretNotFound
+			detail.ErrorMessage = "secret not found"
+			return detail
+		}
 	}
 	decrypted, err := crypto.Decrypt(secret.EncryptedValue, h.secretsKey)
 	if err != nil {

@@ -4,7 +4,6 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -12,11 +11,10 @@ import (
 )
 
 // DeriveTransportKey derives an AES-256 key from the full raw API key.
-// Uses SHA-256 with a domain separator to produce a 32-byte key.
-// Both client and server derive the same key independently.
+// Uses HKDF with a domain separator to produce a 32-byte key, ensuring
+// proper key separation from at-rest encryption keys.
 func DeriveTransportKey(rawAPIKey string) []byte {
-	hash := sha256.Sum256([]byte("reflag-transport:" + rawAPIKey))
-	return hash[:]
+	return hkdfSHA256([]byte("reflag-transport"), []byte(rawAPIKey), 32)
 }
 
 // EncryptPayload encrypts a JSON payload using AES-256-GCM with a key derived

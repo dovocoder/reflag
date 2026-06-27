@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -204,10 +205,30 @@ Example:
 // --- Transport encryption (mirrors server-side crypto/transport.go) ---
 
 // deriveTransportKey derives an AES-256 key from the full raw API key.
-// Uses SHA-256 with a domain separator to produce a 32-byte key.
+// Uses HKDF with a domain separator to match the server's DeriveTransportKey.
 func deriveTransportKey(rawAPIKey string) []byte {
-	hash := sha256.Sum256([]byte("reflag-transport:" + rawAPIKey))
-	return hash[:]
+	return hkdfSHA256([]byte("reflag-transport"), []byte(rawAPIKey), 32)
+}
+
+// hkdfSHA256 implements HKDF with SHA-256 (RFC 5869).
+func hkdfSHA256(salt, ikm []byte, length int) []byte {
+	h := hmac.New(sha256.New, salt)
+	h.Write(ikm)
+	prk := h.Sum(nil)
+
+	info := []byte("reflag-key-derivation")
+	var okm []byte
+	var t []byte
+	counter := 1
+	for len(okm) < length {
+		data := append(append(t, info...), byte(counter))
+		h := hmac.New(sha256.New, prk)
+		h.Write(data)
+		t = h.Sum(nil)
+		okm = append(okm, t...)
+		counter++
+	}
+	return okm[:length]
 }
 
 // decryptPayload decrypts a base64-encoded nonce+ciphertext using AES-256-GCM.
