@@ -462,26 +462,48 @@ func (h *Handler) updateFlag(w http.ResponseWriter, r *http.Request) {
 		middleware.JSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if flag.Key == "" {
-		flag.Key = existing.Key
+	// PATCH semantics: only update fields that are explicitly provided
+	if flag.Key != "" {
+		if !isValidFlagKey(flag.Key) {
+			middleware.JSONError(w, http.StatusBadRequest, "key must be alphanumeric with dashes/underscores, max 128 chars")
+			return
+		}
+		existing.Key = flag.Key
 	}
-	if !isValidFlagKey(flag.Key) {
-		middleware.JSONError(w, http.StatusBadRequest, "key must be alphanumeric with dashes/underscores, max 128 chars")
-		return
+	if flag.Name != "" {
+		if len(flag.Name) > 256 {
+			middleware.JSONError(w, http.StatusBadRequest, "name too long (max 256 chars)")
+			return
+		}
+		existing.Name = flag.Name
 	}
-	if len(flag.Name) > 256 {
-		middleware.JSONError(w, http.StatusBadRequest, "name too long (max 256 chars)")
-		return
+	if flag.Description != "" {
+		existing.Description = flag.Description
 	}
-	flag.ID = id
+	if flag.Type != "" {
+		existing.Type = flag.Type
+	}
+	if flag.Variations != nil {
+		existing.Variations = flag.Variations
+	}
+	if flag.Targeting != nil {
+		existing.Targeting = flag.Targeting
+	}
+	if flag.DefaultRule != nil {
+		existing.DefaultRule = flag.DefaultRule
+	}
+	// Enabled is a bool — can't distinguish "false" from "not set"
+	// So we accept the client's value (PUT semantics for booleans)
+	existing.Enabled = flag.Enabled
+	existing.ID = id
 	// Auto-increment version (never allow user-controlled version regression)
-	flag.Version = existing.Version + 1
-	if err := h.store.UpdateFlag(&flag); err != nil {
+	existing.Version = existing.Version + 1
+	if err := h.store.UpdateFlag(existing); err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to update flag")
 		return
 	}
-	h.audit(auth.ActorFromContext(r.Context()), "UPDATE", "flag", id, flag.Key)
-	middleware.JSONResponse(w, http.StatusOK, flag)
+	h.audit(auth.ActorFromContext(r.Context()), "UPDATE", "flag", id, existing.Key)
+	middleware.JSONResponse(w, http.StatusOK, existing)
 }
 
 func (h *Handler) deleteFlag(w http.ResponseWriter, r *http.Request) {
@@ -524,6 +546,10 @@ func (h *Handler) createEnvironment(w http.ResponseWriter, r *http.Request) {
 	}
 	env.ID = uuid.New().String()
 	if err := h.store.CreateEnvironment(&env); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			middleware.JSONError(w, http.StatusConflict, "environment key already exists")
+			return
+		}
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to create environment")
 		return
 	}
@@ -571,6 +597,10 @@ func (h *Handler) createSegment(w http.ResponseWriter, r *http.Request) {
 	}
 	seg.ID = uuid.New().String()
 	if err := h.store.CreateSegment(&seg); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			middleware.JSONError(w, http.StatusConflict, "segment key already exists")
+			return
+		}
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to create segment")
 		return
 	}
@@ -616,6 +646,31 @@ func (h *Handler) createAPIKey(w http.ResponseWriter, r *http.Request) {
 		middleware.JSONError(w, http.StatusBadRequest, "name is required")
 		return
 	}
+	if len(req.Name) > 128 {
+		middleware.JSONError(w, http.StatusBadRequest, "name too long (max 128 chars)")
+		return
+	}
+	// Validate scopes — only allow known scope values
+	validScopes := map[string]bool{"evaluate": true, "resolve": true, "read": true, "write": true}
+	for _, sc := range req.Scopes {
+		if !validScopes[sc] {
+			middleware.JSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid scope %q — allowed: evaluate, resolve, read, write", sc))
+			return
+		}
+	}
+	// Validate environment_id exists if provided
+	if req.EnvironmentID != "" {
+		env, _ := h.store.GetEnvironment(req.EnvironmentID)
+		if env == nil {
+			// Try by key
+			env, _ = h.store.GetEnvironmentByKey(req.EnvironmentID)
+			if env == nil {
+				middleware.JSONError(w, http.StatusBadRequest, "environment_id does not reference an existing environment")
+				return
+			}
+			req.EnvironmentID = env.ID
+		}
+	}
 	rawKey, hash, prefix, err := auth.GenerateAPIKey()
 	if err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to generate API key")
@@ -633,6 +688,10 @@ func (h *Handler) createAPIKey(w http.ResponseWriter, r *http.Request) {
 		Scopes:       req.Scopes,
 	}
 	if err := h.store.CreateAPIKey(apiKey); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			middleware.JSONError(w, http.StatusConflict, "API key already exists")
+			return
+		}
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to create API key")
 		return
 	}
@@ -978,6 +1037,10 @@ func isValidRole(role string) bool {
 }
 
 func (h *Handler) audit(actor, action, resource, resourceID, details string) {
+	// Sanitize user-controlled fields to prevent log injection
+	actor = sanitizeAuditField(actor)
+	resourceID = sanitizeAuditField(resourceID)
+	details = sanitizeAuditField(details)
 	entry := &models.AuditLogEntry{
 		ID:         uuid.New().String(),
 		Actor:      actor,
@@ -987,6 +1050,17 @@ func (h *Handler) audit(actor, action, resource, resourceID, details string) {
 		Details:    details,
 	}
 	_ = h.store.CreateAuditEntry(entry)
+}
+
+// sanitizeAuditField strips newlines and truncates to prevent log injection.
+func sanitizeAuditField(s string) string {
+	s = strings.ReplaceAll(s, "\n", "")
+	s = strings.ReplaceAll(s, "\r", "")
+	s = strings.ReplaceAll(s, "	", " ")
+	if len(s) > 500 {
+		s = s[:500]
+	}
+	return s
 }
 
 // resolveSecretRefs checks if the evaluated value is a secret reference
@@ -1067,6 +1141,22 @@ func (h *Handler) createSecret(w http.ResponseWriter, r *http.Request) {
 		middleware.JSONError(w, http.StatusBadRequest, "value is required")
 		return
 	}
+	if len(req.Value) > 65536 {
+		middleware.JSONError(w, http.StatusBadRequest, "value too long (max 64KB)")
+		return
+	}
+	// Validate environment_id if provided
+	if req.EnvironmentID != "" {
+		env, _ := h.store.GetEnvironment(req.EnvironmentID)
+		if env == nil {
+			env, _ = h.store.GetEnvironmentByKey(req.EnvironmentID)
+			if env == nil {
+				middleware.JSONError(w, http.StatusBadRequest, "environment_id does not reference an existing environment")
+				return
+			}
+			req.EnvironmentID = env.ID
+		}
+	}
 
 	encrypted, err := crypto.Encrypt(req.Value, h.secretsKey)
 	if err != nil {
@@ -1135,10 +1225,10 @@ func (h *Handler) updateSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Key         string `json:"key"`
-		Name        string `json:"name"`
-		Description string `json:"description"`
-		Value       string `json:"value"`
+		Key           string `json:"key"`
+		Name          string `json:"name"`
+		Description   string `json:"description"`
+		Value         string `json:"value"`
 		EnvironmentID string `json:"environment_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1146,24 +1236,38 @@ func (h *Handler) updateSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	existing.Key = req.Key
-	existing.Name = req.Name
-	existing.Description = req.Description
-	existing.EnvironmentID = req.EnvironmentID
-
-	if req.Key != "" && !isValidKey(req.Key) {
-		middleware.JSONError(w, http.StatusBadRequest, "key must be alphanumeric with dashes/underscores, max 128 chars")
-		return
+	// PATCH semantics: only update fields that are provided (non-empty)
+	if req.Key != "" {
+		if !isValidKey(req.Key) {
+			middleware.JSONError(w, http.StatusBadRequest, "key must be alphanumeric with dashes/underscores, max 128 chars")
+			return
+		}
+		existing.Key = req.Key
 	}
-
-	// Only re-encrypt if a new value is provided
+	if req.Name != "" {
+		if len(req.Name) > 256 {
+			middleware.JSONError(w, http.StatusBadRequest, "name too long (max 256 chars)")
+			return
+		}
+		existing.Name = req.Name
+	}
+	if req.Description != "" {
+		existing.Description = req.Description
+	}
 	if req.Value != "" {
+		if len(req.Value) > 65536 {
+			middleware.JSONError(w, http.StatusBadRequest, "value too long (max 64KB)")
+			return
+		}
 		encrypted, err := crypto.Encrypt(req.Value, h.secretsKey)
 		if err != nil {
 			middleware.JSONError(w, http.StatusInternalServerError, "encryption failed")
 			return
 		}
 		existing.EncryptedValue = encrypted
+	}
+	if req.EnvironmentID != "" {
+		existing.EnvironmentID = req.EnvironmentID
 	}
 
 	if err := h.store.UpdateSecret(existing); err != nil {

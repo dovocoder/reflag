@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 )
 
 // Config holds all application configuration values.
@@ -59,17 +60,36 @@ func Load() (*Config, error) {
 	if isProd && len(secretsKey) < 32 {
 		return nil, fmt.Errorf("SECRETS_KEY or JWT_SECRET must be at least 32 characters for secrets encryption in production")
 	}
+	oidcIssuer := os.Getenv("OIDC_ISSUER")
+	oidcRedirect := os.Getenv("OIDC_REDIRECT_URL")
+	adminEmail := os.Getenv("ADMIN_EMAIL")
+	adminPassword := os.Getenv("ADMIN_PASSWORD")
+	// Production-only validation
+	if isProd {
+		if adminEmail == "" {
+			return nil, fmt.Errorf("ADMIN_EMAIL must be set in production")
+		}
+		if len(adminPassword) < 12 {
+			return nil, fmt.Errorf("ADMIN_PASSWORD must be at least 12 characters in production")
+		}
+		if oidcIssuer != "" && strings.HasPrefix(oidcIssuer, "http://") && !strings.Contains(oidcIssuer, "localhost") {
+			return nil, fmt.Errorf("OIDC_ISSUER must use https:// in production (got %s)", oidcIssuer)
+		}
+		if oidcRedirect != "" && strings.HasPrefix(oidcRedirect, "http://") && !strings.Contains(oidcRedirect, "localhost") {
+			return nil, fmt.Errorf("OIDC_REDIRECT_URL must use https:// in production (got %s)", oidcRedirect)
+		}
+	}
 	return &Config{
 		Port:          port,
 		DBPath:        dbPath,
 		JWTSecret:     jwtSecret,
-		OIDCIssuer:    os.Getenv("OIDC_ISSUER"),
+		OIDCIssuer:    oidcIssuer,
 		OIDCClientID:  os.Getenv("OIDC_CLIENT_ID"),
 		OIDCClientSec: os.Getenv("OIDC_CLIENT_SECRET"),
-		OIDCRedirect:  os.Getenv("OIDC_REDIRECT_URL"),
-		SecretsKey:     secretsKey,
-		AdminEmail:    os.Getenv("ADMIN_EMAIL"),
-		AdminPassword: os.Getenv("ADMIN_PASSWORD"),
+		OIDCRedirect:  oidcRedirect,
+		SecretsKey:    secretsKey,
+		AdminEmail:    adminEmail,
+		AdminPassword: adminPassword,
 		IsProduction:  isProd,
 	}, nil
 }

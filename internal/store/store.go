@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/dovocoder/reflag/internal/models"
 	"github.com/google/uuid"
@@ -105,7 +106,7 @@ func (s *Store) migrate() error {
 			name TEXT NOT NULL,
 			description TEXT DEFAULT '',
 			encrypted_value TEXT NOT NULL,
-			environment_id TEXT DEFAULT '',
+			environment_id TEXT REFERENCES environments(id) ON DELETE SET NULL,
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
@@ -154,10 +155,17 @@ func (s *Store) migrate() error {
 		rows.Close()
 	}
 	if !hasVersion {
-		s.db.Exec(`ALTER TABLE flags ADD COLUMN version INTEGER NOT NULL DEFAULT 1`)
+		if _, err := s.db.Exec(`ALTER TABLE flags ADD COLUMN version INTEGER NOT NULL DEFAULT 1`); err != nil {
+			return fmt.Errorf("alter flags table (add version): %w", err)
+		}
 	}
 	// Add role column to users table for existing DBs
-	s.db.Exec(`ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'member'`)
+	if _, err := s.db.Exec(`ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'member'`); err != nil {
+		// Column may already exist — only fail on other errors
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("alter users table (add role): %w", err)
+		}
+	}
 	return nil
 }
 
@@ -300,19 +308,11 @@ func (s *Store) GetFlagConfig(flagID, envID string) (*models.Flag, error) {
 }
 
 func (s *Store) UpsertFlagConfig(flagID, envID string, enabled bool, data json.RawMessage) error {
-	// Try update first
-	res, err := s.db.Exec(`UPDATE flag_configs SET enabled=?, data=?, updated_at=CURRENT_TIMESTAMP WHERE flag_id=? AND environment_id=?`,
-		boolToInt(enabled), string(data), flagID, envID)
-	if err != nil {
-		return err
-	}
-	rows, _ := res.RowsAffected()
-	if rows > 0 {
-		return nil
-	}
-	// Insert new
+	// Use SQLite native upsert to handle race conditions
 	id := generateID()
-	_, err = s.db.Exec(`INSERT INTO flag_configs (id, flag_id, environment_id, enabled, data) VALUES (?, ?, ?, ?, ?)`,
+	_, err := s.db.Exec(`INSERT INTO flag_configs (id, flag_id, environment_id, enabled, data)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(flag_id, environment_id) DO UPDATE SET enabled=excluded.enabled, data=excluded.data, updated_at=CURRENT_TIMESTAMP`,
 		id, flagID, envID, boolToInt(enabled), string(data))
 	return err
 }
@@ -487,11 +487,17 @@ func (s *Store) GetOrCreateUser(email, name string) (*models.User, error) {
 	if err != sql.ErrNoRows {
 		return nil, err
 	}
+	// Use INSERT ON CONFLICT to handle race condition (two concurrent logins for same email)
 	u.ID = generateID()
 	u.Email = email
 	u.Name = name
 	u.Role = "member"
-	_, err = s.db.Exec(`INSERT INTO users (id, email, name, role) VALUES (?, ?, ?, ?)`, u.ID, u.Email, u.Name, u.Role)
+	_, err = s.db.Exec(`INSERT INTO users (id, email, name, role) VALUES (?, ?, ?, ?) ON CONFLICT(email) DO NOTHING`, u.ID, u.Email, u.Name, u.Role)
+	if err != nil {
+		return nil, err
+	}
+	// Re-select to get the row (either ours or the winner of the race)
+	err = s.db.QueryRow(`SELECT id, email, name, role FROM users WHERE email = ?`, email).Scan(&u.ID, &u.Email, &u.Name, &u.Role)
 	if err != nil {
 		return nil, err
 	}
