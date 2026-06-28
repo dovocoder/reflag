@@ -64,9 +64,15 @@ func isOriginAllowed(origin string) bool {
 		return true
 	}
 	// Dev fallback: allow localhost origins only when not in production
+	// and when no explicit CORS_ORIGINS have been configured
 	if os.Getenv("APP_ENV") != "production" {
-		_, hasConfig := allowedOrigins.Load("__configured__")
-		if !hasConfig {
+		// Check if any origins are configured — if so, dev fallback is disabled
+		anyConfigured := false
+		allowedOrigins.Range(func(key, val any) bool {
+			anyConfigured = true
+			return false
+		})
+		if !anyConfigured {
 			if strings.HasPrefix(origin, "http://localhost") || strings.HasPrefix(origin, "http://127.0.0.1") {
 				return true
 			}

@@ -1270,7 +1270,17 @@ func (h *Handler) resolveSecretRefs(r *http.Request, flag *models.Flag, detail o
 		return detail
 	}
 	// Enforce API key environment scoping on secret resolution
-	if apiKey := auth.APIKeyFromContext(r.Context()); apiKey != nil && apiKey.EnvironmentID != "" {
+	// R13-H1: An evaluate-scope API key without environment scoping must not
+	// be able to resolve secrets via $secret references in flag values.
+	// Without this check, any evaluate key can extract any secret by creating
+	// a flag with a {"$secret": "KEY"} variation value.
+	if apiKey := auth.APIKeyFromContext(r.Context()); apiKey != nil {
+		if apiKey.EnvironmentID == "" {
+			detail.Reason = openfeature.ReasonError
+			detail.ErrorCode = openfeature.ErrSecretNotFound
+			detail.ErrorMessage = "secret not found"
+			return detail
+		}
 		if secret.EnvironmentID != apiKey.EnvironmentID {
 			detail.Reason = openfeature.ReasonError
 			detail.ErrorCode = openfeature.ErrSecretNotFound
