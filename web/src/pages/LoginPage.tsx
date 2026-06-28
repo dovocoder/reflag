@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { api, setToken } from "@/lib/api";
+import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
 import { Input, Label } from "@/components/ui/form";
@@ -19,8 +19,8 @@ export function LoginPage({ onLogin, onRoleChange }: { onLogin: () => void; onRo
     try {
       setLoading(true);
       setError("");
-      const { token, user } = await api.adminLogin({ email, password });
-      setToken(token);
+      const { user } = await api.adminLogin({ email, password });
+      // Token is set as HttpOnly cookie by the server — no client-side handling needed
       if (user?.role) {
         sessionStorage.setItem("reflag_role", user.role);
         onRoleChange?.(user.role);
@@ -72,8 +72,8 @@ export function LoginPage({ onLogin, onRoleChange }: { onLogin: () => void; onRo
         credentials: "include", // R6-F4: ensure cookie is set
       });
       const data = await res.json();
-      if (data.token) {
-        setToken(data.token);
+      if (res.ok && data.user) {
+        // Token is set as HttpOnly cookie by the server
         if (data.user?.role) {
           sessionStorage.setItem("reflag_role", data.user.role);
           onRoleChange?.(data.user.role);

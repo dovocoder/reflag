@@ -219,9 +219,9 @@ func (h *Handler) oidcCallback(w http.ResponseWriter, r *http.Request) {
 		SameSite:  http.SameSiteLaxMode,
 		Secure:    isTLS,
 	})
+	// R16-M1: Token is set as HttpOnly cookie — don't return in response body
 	middleware.JSONResponse(w, http.StatusOK, map[string]any{
-		"token": token,
-		"user":  user,
+		"user": user,
 	})
 }
 
@@ -887,9 +887,11 @@ func (h *Handler) adminLogin(w http.ResponseWriter, r *http.Request) {
 		SameSite:  http.SameSiteLaxMode,
 		Secure:    isTLS,
 	})
+	// R16-M1: Token is set as HttpOnly cookie — don't return in response body
+	// to prevent XSS from accessing it. The frontend doesn't use the token
+	// from the response (setToken is a no-op).
 	middleware.JSONResponse(w, http.StatusOK, map[string]any{
-		"token": token,
-		"user":  user,
+		"user": user,
 	})
 }
 

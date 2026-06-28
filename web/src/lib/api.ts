@@ -171,7 +171,7 @@ export const api = {
       method: "POST",
     }),
   adminLogin: (data: { email: string; password: string }) =>
-    request<{ token: string; user: User }>("/auth/login", {
+    request<{ user: User }>("/auth/login", {
       method: "POST",
       body: JSON.stringify(data),
     }),
