@@ -359,11 +359,14 @@ func (a *AuthService) ExchangeCode(code, codeVerifier string) (*models.User, str
 		return nil, "", err
 	}
 
-	// Verify the ID token if present — this is the cryptographic proof of identity
-	if tokenResp.IDToken != "" {
-		if err := a.verifyIDToken(tokenResp.IDToken); err != nil {
-			return nil, "", fmt.Errorf("ID token verification failed: %w", err)
-		}
+	// R10-M7: Require ID token — without it, there's no cryptographic
+	// proof of identity. The userinfo endpoint alone is not sufficient
+	// because the access token could be intercepted or leaked.
+	if tokenResp.IDToken == "" {
+		return nil, "", fmt.Errorf("OIDC provider did not return an ID token — cannot verify identity")
+	}
+	if err := a.verifyIDToken(tokenResp.IDToken); err != nil {
+		return nil, "", fmt.Errorf("ID token verification failed: %w", err)
 	}
 
 	// Fetch userinfo

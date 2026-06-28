@@ -1503,6 +1503,14 @@ func (h *Handler) deleteSecret(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) resolveSecret(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
+	// R10-M6: Require environment scoping on all resolve endpoints —
+	// an API key without environment scoping should not be able to
+	// resolve individual secrets by key (same policy as resolveAllSecrets)
+	apiKey := auth.APIKeyFromContext(r.Context())
+	if apiKey == nil || apiKey.EnvironmentID == "" {
+		middleware.JSONError(w, http.StatusForbidden, "API key must be scoped to an environment")
+		return
+	}
 	secret, err := h.store.GetSecretByKey(key)
 	if err != nil || secret == nil {
 		middleware.JSONResponse(w, http.StatusNotFound, map[string]any{
@@ -1511,9 +1519,8 @@ func (h *Handler) resolveSecret(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// Scope by API key's environment if set
-	apiKey := auth.APIKeyFromContext(r.Context())
-	if apiKey != nil && apiKey.EnvironmentID != "" && secret.EnvironmentID != apiKey.EnvironmentID {
+	// Enforce environment scoping
+	if secret.EnvironmentID != apiKey.EnvironmentID {
 		middleware.JSONResponse(w, http.StatusNotFound, map[string]any{
 			"errorCode":    "SECRET_NOT_FOUND",
 			"errorMessage": "secret not found",
@@ -1563,12 +1570,12 @@ func (h *Handler) resolveAllSecrets(w http.ResponseWriter, r *http.Request) {
 
 // writeEncrypted encrypts the response body using a transport key derived
 // from the API key. The response contains the encrypted payload and metadata.
-// Falls back to plain JSON if no API key is available (shouldn't happen for resolve endpoints).
+// R10-M8: Fail hard if no API key is available — never fall back to plain JSON
+// for resolve endpoints, as that would leak decrypted secret values.
 func (h *Handler) writeEncrypted(w http.ResponseWriter, r *http.Request, data any) {
 	rawKey := auth.RawAPIKeyFromContext(r.Context())
 	if rawKey == "" {
-		// No API key in context — shouldn't happen, but fall back to plain JSON
-		middleware.JSONResponse(w, http.StatusOK, data)
+		middleware.JSONError(w, http.StatusInternalServerError, "transport encryption required but no API key available")
 		return
 	}
 
