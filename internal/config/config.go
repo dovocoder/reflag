@@ -19,7 +19,7 @@ type Config struct {
 	OIDCClientSec string
 	OIDCRedirect  string
 	// Encryption key for secrets at rest (derived from JWT_SECRET or SECRETS_KEY)
-	SecretsKey     string
+	SecretsKey string
 	// Hardcoded admin credentials (env: ADMIN_EMAIL, ADMIN_PASSWORD)
 	AdminEmail    string
 	AdminPassword string
@@ -71,6 +71,9 @@ func Load() (*Config, error) {
 		}
 		if len(adminPassword) < 12 {
 			return nil, fmt.Errorf("ADMIN_PASSWORD must be at least 12 characters in production")
+		}
+		if len(jwtSecret) < 32 {
+			return nil, fmt.Errorf("JWT_SECRET must be at least 32 characters in production")
 		}
 		if oidcIssuer != "" && strings.HasPrefix(oidcIssuer, "http://") && !strings.Contains(oidcIssuer, "localhost") {
 			return nil, fmt.Errorf("OIDC_ISSUER must use https:// in production (got %s)", oidcIssuer)

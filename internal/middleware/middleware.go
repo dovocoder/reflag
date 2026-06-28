@@ -2,7 +2,6 @@ package middleware
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -253,29 +252,6 @@ func RateLimitMiddleware(limiter *RateLimiter, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-// RequestLogger logs each request in structured format.
-func RequestLogger(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		rw := &statusWriter{ResponseWriter: w, status: 200}
-		next.ServeHTTP(rw, r)
-		// Skip health check logging to reduce noise
-		if r.URL.Path != "/health" {
-			log.Printf("%s %s %d %s", r.Method, r.URL.Path, rw.status, time.Since(start))
-		}
-	})
-}
-
-type statusWriter struct {
-	http.ResponseWriter
-	status int
-}
-
-func (w *statusWriter) WriteHeader(code int) {
-	w.status = code
-	w.ResponseWriter.WriteHeader(code)
 }
 
 // CSRFMiddleware validates CSRF tokens for state-changing requests.

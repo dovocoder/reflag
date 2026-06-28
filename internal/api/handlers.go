@@ -17,8 +17,8 @@ import (
 )
 
 type Handler struct {
-	store     *store.Store
-	auth      *auth.AuthService
+	store      *store.Store
+	auth       *auth.AuthService
 	secretsKey []byte
 }
 
@@ -130,26 +130,26 @@ func (h *Handler) oidcStart(w http.ResponseWriter, r *http.Request) {
 	isTLS := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 	http.SetCookie(w, &http.Cookie{
 		Name:     "reflag_oidc_state",
-		Value:     state,
+		Value:    state,
 		Path:     "/",
 		MaxAge:   600, // 10 minutes
-		HttpOnly:  true,
-		SameSite:  http.SameSiteLaxMode,
-		Secure:    isTLS,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   isTLS,
 	})
 	// Set SameSite=Lax cookie for PKCE verifier
 	http.SetCookie(w, &http.Cookie{
 		Name:     "reflag_pkce_verifier",
-		Value:     verifier,
+		Value:    verifier,
 		Path:     "/",
 		MaxAge:   600,
-		HttpOnly:  true,
-		SameSite:  http.SameSiteLaxMode,
-		Secure:    isTLS,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   isTLS,
 	})
 	middleware.JSONResponse(w, http.StatusOK, map[string]string{
 		"authorization_url": authURL,
-		"state":            state,
+		"state":             state,
 	})
 }
 
@@ -212,12 +212,12 @@ func (h *Handler) oidcCallback(w http.ResponseWriter, r *http.Request) {
 	isTLS := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 	http.SetCookie(w, &http.Cookie{
 		Name:     "reflag_token",
-		Value:     token,
+		Value:    token,
 		Path:     "/",
 		MaxAge:   86400, // 24 hours
-		HttpOnly:  true,
-		SameSite:  http.SameSiteLaxMode,
-		Secure:    isTLS,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   isTLS,
 	})
 	// R16-M1: Token is set as HttpOnly cookie — don't return in response body
 	middleware.JSONResponse(w, http.StatusOK, map[string]any{
@@ -244,8 +244,8 @@ func (h *Handler) evaluateFlag(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) evaluateFlagByKey(w http.ResponseWriter, r *http.Request) {
 	flagKey := r.PathValue("key")
 	var req struct {
-		DefaultValue any                    `json:"defaultValue"`
-		Environment  string                 `json:"environment,omitempty"`
+		DefaultValue any                           `json:"defaultValue"`
+		Environment  string                        `json:"environment,omitempty"`
 		Context      openfeature.EvaluationContext `json:"context,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -797,12 +797,12 @@ func (h *Handler) createAPIKey(w http.ResponseWriter, r *http.Request) {
 		req.Scopes = []string{}
 	}
 	apiKey := &models.APIKey{
-		ID:           uuid.New().String(),
-		Name:         req.Name,
-		KeyHash:      hash,
-		KeyPrefix:    prefix,
+		ID:            uuid.New().String(),
+		Name:          req.Name,
+		KeyHash:       hash,
+		KeyPrefix:     prefix,
 		EnvironmentID: req.EnvironmentID,
-		Scopes:       req.Scopes,
+		Scopes:        req.Scopes,
 	}
 	if err := h.store.CreateAPIKey(apiKey); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
@@ -815,13 +815,13 @@ func (h *Handler) createAPIKey(w http.ResponseWriter, r *http.Request) {
 	h.audit(auth.ActorFromContext(r.Context()), "CREATE", "api_key", apiKey.ID, req.Name)
 	// Return the raw key only on creation
 	middleware.JSONResponse(w, http.StatusCreated, map[string]any{
-		"id":           apiKey.ID,
-		"name":         apiKey.Name,
-		"key":          rawKey,
-		"key_prefix":   prefix,
+		"id":             apiKey.ID,
+		"name":           apiKey.Name,
+		"key":            rawKey,
+		"key_prefix":     prefix,
 		"environment_id": req.EnvironmentID,
-		"scopes":       req.Scopes,
-		"created_at":   apiKey.CreatedAt,
+		"scopes":         req.Scopes,
+		"created_at":     apiKey.CreatedAt,
 	})
 }
 
@@ -880,12 +880,12 @@ func (h *Handler) adminLogin(w http.ResponseWriter, r *http.Request) {
 	isTLS := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 	http.SetCookie(w, &http.Cookie{
 		Name:     "reflag_token",
-		Value:     token,
+		Value:    token,
 		Path:     "/",
 		MaxAge:   86400, // 24 hours
-		HttpOnly:  true,
-		SameSite:  http.SameSiteLaxMode,
-		Secure:    isTLS,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   isTLS,
 	})
 	// R16-M1: Token is set as HttpOnly cookie — don't return in response body
 	// to prevent XSS from accessing it. The frontend doesn't use the token
@@ -899,12 +899,12 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 	isTLS := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 	http.SetCookie(w, &http.Cookie{
 		Name:     "reflag_token",
-		Value:     "",
+		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,
-		HttpOnly:  true,
-		SameSite:  http.SameSiteLaxMode,
-		Secure:    isTLS,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   isTLS,
 	})
 	middleware.JSONResponse(w, http.StatusOK, map[string]string{"status": "logged out"})
 }
@@ -1270,6 +1270,19 @@ func (h *Handler) resolveSecretRefs(r *http.Request, flag *models.Flag, detail o
 		detail.ErrorMessage = "$secret value must be a string"
 		return detail
 	}
+
+	// Only admin JWT users and environment-scoped API keys may resolve secret
+	// references. OIDC members (role "member") must not be able to extract
+	// secrets by evaluating flags that contain {"$secret": "KEY"} values.
+	user := auth.UserFromContext(r.Context())
+	apiKey := auth.APIKeyFromContext(r.Context())
+	if apiKey == nil && (user == nil || user.Role != "admin") {
+		detail.Reason = openfeature.ReasonError
+		detail.ErrorCode = openfeature.ErrSecretResolution
+		detail.ErrorMessage = "secret resolution not authorized"
+		return detail
+	}
+
 	secret, err := h.store.GetSecretByKey(keyStr)
 	if err != nil || secret == nil {
 		detail.Reason = openfeature.ReasonError
@@ -1282,7 +1295,7 @@ func (h *Handler) resolveSecretRefs(r *http.Request, flag *models.Flag, detail o
 	// be able to resolve secrets via $secret references in flag values.
 	// Without this check, any evaluate key can extract any secret by creating
 	// a flag with a {"$secret": "KEY"} variation value.
-	if apiKey := auth.APIKeyFromContext(r.Context()); apiKey != nil {
+	if apiKey != nil {
 		if apiKey.EnvironmentID == "" {
 			detail.Reason = openfeature.ReasonError
 			detail.ErrorCode = openfeature.ErrSecretNotFound
@@ -1396,8 +1409,8 @@ func (h *Handler) createSecret(w http.ResponseWriter, r *http.Request) {
 		"key":            secret.Key,
 		"name":           secret.Name,
 		"description":    secret.Description,
-		"environment_id":  secret.EnvironmentID,
-		"version":         secret.Version,
+		"environment_id": secret.EnvironmentID,
+		"version":        secret.Version,
 		"created_at":     secret.CreatedAt,
 	})
 }
@@ -1416,15 +1429,15 @@ func (h *Handler) getSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	middleware.JSONResponse(w, http.StatusOK, map[string]any{
-		"id":            secret.ID,
-		"key":           secret.Key,
-		"name":          secret.Name,
-		"description":   secret.Description,
-		"value":         decrypted,
+		"id":             secret.ID,
+		"key":            secret.Key,
+		"name":           secret.Name,
+		"description":    secret.Description,
+		"value":          decrypted,
 		"environment_id": secret.EnvironmentID,
-		"version":       secret.Version,
-		"created_at":    secret.CreatedAt,
-		"updated_at":    secret.UpdatedAt,
+		"version":        secret.Version,
+		"created_at":     secret.CreatedAt,
+		"updated_at":     secret.UpdatedAt,
 	})
 }
 
@@ -1503,13 +1516,13 @@ func (h *Handler) updateSecret(w http.ResponseWriter, r *http.Request) {
 	}
 	h.audit(auth.ActorFromContext(r.Context()), "UPDATE", "secret", id, existing.Key)
 	middleware.JSONResponse(w, http.StatusOK, map[string]any{
-		"id":            existing.ID,
-		"key":           existing.Key,
-		"name":          existing.Name,
-		"description":   existing.Description,
+		"id":             existing.ID,
+		"key":            existing.Key,
+		"name":           existing.Name,
+		"description":    existing.Description,
 		"environment_id": existing.EnvironmentID,
-		"version":       existing.Version + 1,
-		"updated_at":    existing.UpdatedAt,
+		"version":        existing.Version + 1,
+		"updated_at":     existing.UpdatedAt,
 	})
 }
 

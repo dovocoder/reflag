@@ -28,29 +28,22 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-const (
-	// Context keys
-	ContextKeyUser    = "user"
-	ContextKeyAPIKey  = "apiKey"
-	ContextKeyActor   = "actor"
-)
-
 // AuthService handles both OIDC (admin UI) and API key (programmatic) auth.
 type AuthService struct {
-	store     *store.Store
-	jwtSecret string
+	store         *store.Store
+	jwtSecret     string
 	oidcIssuer    string
 	oidcClientID  string
 	oidcClientSec string
 	oidcRedirect  string
 
 	// Hardcoded admin credentials
-	adminEmail      string
-	adminPassHash   []byte // bcrypt hash
+	adminEmail    string
+	adminPassHash []byte // bcrypt hash
 
 	// OIDC discovery cache
-	mu            sync.Mutex
-	discovery     *OIDCDiscovery
+	mu              sync.Mutex
+	discovery       *OIDCDiscovery
 	discoveryExpiry time.Time
 
 	// HTTP client with timeout for OIDC requests
@@ -227,6 +220,7 @@ func HasScope(ctx context.Context, scope string) bool {
 	}
 	return false
 }
+
 // RequireScope is middleware that checks the API key has the required scope.
 // JWT-authenticated users (admin UI) bypass scope checks — they have full access.
 func (a *AuthService) RequireScope(scope string) func(http.Handler) http.Handler {
@@ -276,6 +270,9 @@ func (a *AuthService) GetDiscovery() (*OIDCDiscovery, error) {
 	var d OIDCDiscovery
 	if err := json.Unmarshal(body, &d); err != nil {
 		return nil, err
+	}
+	if d.Issuer != a.oidcIssuer {
+		return nil, fmt.Errorf("OIDC discovery issuer mismatch: expected %q, got %q", a.oidcIssuer, d.Issuer)
 	}
 	a.discovery = &d
 	a.discoveryExpiry = time.Now().Add(15 * time.Minute)
@@ -365,7 +362,8 @@ func (a *AuthService) ExchangeCode(code, codeVerifier string) (*models.User, str
 	if tokenResp.IDToken == "" {
 		return nil, "", fmt.Errorf("OIDC provider did not return an ID token — cannot verify identity")
 	}
-	if err := a.verifyIDToken(tokenResp.IDToken); err != nil {
+	idTokenClaims, err := a.verifyIDToken(tokenResp.IDToken)
+	if err != nil {
 		return nil, "", fmt.Errorf("ID token verification failed: %w", err)
 	}
 
@@ -397,7 +395,12 @@ func (a *AuthService) ExchangeCode(code, codeVerifier string) (*models.User, str
 	if info.Sub == "" {
 		return nil, "", fmt.Errorf("OIDC userinfo missing sub claim")
 	}
-	user, err := a.store.GetOrCreateUserBySub(info.Sub, info.Email, info.Name)
+	// R17-M?: Verify the userinfo subject matches the verified ID token subject
+	// to prevent token substitution attacks.
+	if info.Sub != idTokenClaims.Subject {
+		return nil, "", fmt.Errorf("OIDC userinfo subject does not match ID token subject")
+	}
+	user, err := a.store.GetOrCreateUserBySub(idTokenClaims.Subject, info.Email, info.Name)
 	if err != nil {
 		return nil, "", err
 	}
@@ -588,43 +591,44 @@ func (a *AuthService) ValidateState(state string) bool {
 
 // verifyIDToken verifies the OIDC ID token signature and claims.
 // Fetches the JWKS from the issuer's jwks_uri and validates the token.
-func (a *AuthService) verifyIDToken(idToken string) error {
+// On success it returns the verified registered claims.
+func (a *AuthService) verifyIDToken(idToken string) (*jwt.RegisteredClaims, error) {
 	d, err := a.GetDiscovery()
 	if err != nil {
-		return fmt.Errorf("discovery failed: %w", err)
+		return nil, fmt.Errorf("discovery failed: %w", err)
 	}
 	// Parse the token without verification first to get the kid
 	parsed, _, err := jwt.NewParser().ParseUnverified(idToken, &jwt.RegisteredClaims{})
 	if err != nil {
-		return fmt.Errorf("failed to parse ID token: %w", err)
+		return nil, fmt.Errorf("failed to parse ID token: %w", err)
 	}
 	// Validate issuer and audience
 	claims, ok := parsed.Claims.(*jwt.RegisteredClaims)
 	if !ok {
-		return fmt.Errorf("unexpected claims type in ID token")
+		return nil, fmt.Errorf("unexpected claims type in ID token")
 	}
 	if claims.Issuer != a.oidcIssuer {
-		return fmt.Errorf("ID token issuer mismatch: expected %s, got %s", a.oidcIssuer, claims.Issuer)
+		return nil, fmt.Errorf("ID token issuer mismatch: expected %s, got %s", a.oidcIssuer, claims.Issuer)
 	}
-	if len(claims.Audience) > 0 && claims.Audience[0] != a.oidcClientID {
-		return fmt.Errorf("ID token audience mismatch")
+	if err := a.validateIDTokenAudience(claims); err != nil {
+		return nil, err
 	}
 	if claims.ExpiresAt != nil && time.Now().After(claims.ExpiresAt.Time) {
-		return fmt.Errorf("ID token expired")
+		return nil, fmt.Errorf("ID token expired")
 	}
 	// R8-M2: Check not-before claim — reject tokens that are not yet valid
 	if claims.NotBefore != nil && time.Now().Before(claims.NotBefore.Time) {
-		return fmt.Errorf("ID token not yet valid")
+		return nil, fmt.Errorf("ID token not yet valid")
 	}
 	// Fetch JWKS and verify signature
 	jwksResp, err := a.httpClient.Get(d.JWKSURI)
 	if err != nil {
-		return fmt.Errorf("failed to fetch JWKS: %w", err)
+		return nil, fmt.Errorf("failed to fetch JWKS: %w", err)
 	}
 	defer jwksResp.Body.Close()
 	jwksBody, err := io.ReadAll(io.LimitReader(jwksResp.Body, 1<<20))
 	if err != nil {
-		return fmt.Errorf("failed to read JWKS: %w", err)
+		return nil, fmt.Errorf("failed to read JWKS: %w", err)
 	}
 	var jwks struct {
 		Keys []struct {
@@ -636,7 +640,7 @@ func (a *AuthService) verifyIDToken(idToken string) error {
 		} `json:"keys"`
 	}
 	if err := json.Unmarshal(jwksBody, &jwks); err != nil {
-		return fmt.Errorf("failed to parse JWKS: %w", err)
+		return nil, fmt.Errorf("failed to parse JWKS: %w", err)
 	}
 	// Find the signing key by kid
 	kid := ""
@@ -648,7 +652,7 @@ func (a *AuthService) verifyIDToken(idToken string) error {
 	if kid == "" {
 		// R5-16: Reject tokens without kid when multiple keys exist in JWKS
 		if len(jwks.Keys) != 1 {
-			return fmt.Errorf("ID token missing kid and multiple JWKS keys present")
+			return nil, fmt.Errorf("ID token missing kid and multiple JWKS keys present")
 		}
 	}
 	var signingKey *struct {
@@ -665,10 +669,10 @@ func (a *AuthService) verifyIDToken(idToken string) error {
 		}
 	}
 	if signingKey == nil {
-		return fmt.Errorf("signing key not found in JWKS for kid %s", kid)
+		return nil, fmt.Errorf("signing key not found in JWKS for kid %s", kid)
 	}
 	// Verify the token signature using the JWKS key
-	_, err = jwt.Parse(idToken, func(t *jwt.Token) (any, error) {
+	verified, err := jwt.Parse(idToken, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
@@ -692,7 +696,22 @@ func (a *AuthService) verifyIDToken(idToken string) error {
 		return pubKey, nil
 	}, jwt.WithIssuer(a.oidcIssuer), jwt.WithAudience(a.oidcClientID))
 	if err != nil {
-		return fmt.Errorf("ID token signature verification failed: %w", err)
+		return nil, fmt.Errorf("ID token signature verification failed: %w", err)
+	}
+	verifiedClaims, ok := verified.Claims.(*jwt.RegisteredClaims)
+	if !ok {
+		return nil, fmt.Errorf("unexpected verified claims type in ID token")
+	}
+	return verifiedClaims, nil
+}
+
+// validateIDTokenAudience checks the audience claim of an ID token.
+// Reflag's OIDC client is a public web client and expects a single audience
+// equal to its client_id; multiple audiences are rejected as a defense-in-depth
+// measure against token confusion attacks.
+func (a *AuthService) validateIDTokenAudience(claims *jwt.RegisteredClaims) error {
+	if len(claims.Audience) != 1 || claims.Audience[0] != a.oidcClientID {
+		return fmt.Errorf("ID token audience invalid: expected %q, got %v", a.oidcClientID, claims.Audience)
 	}
 	return nil
 }

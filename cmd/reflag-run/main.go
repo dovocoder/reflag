@@ -2,11 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -20,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/dovocoder/reflag/internal/crypto"
 )
 
 const version = "1.0.0"
@@ -215,66 +212,9 @@ Example:
 	}
 }
 
-// --- Transport encryption (mirrors server-side crypto/transport.go) ---
-
-// deriveTransportKey derives an AES-256 key from the full raw API key.
-// Uses HKDF with a domain separator to match the server's DeriveTransportKey.
-func deriveTransportKey(rawAPIKey string) []byte {
-	return hkdfSHA256([]byte("reflag-transport"), []byte(rawAPIKey), 32)
-}
-
-// hkdfSHA256 implements HKDF with SHA-256 (RFC 5869).
-func hkdfSHA256(salt, ikm []byte, length int) []byte {
-	h := hmac.New(sha256.New, salt)
-	h.Write(ikm)
-	prk := h.Sum(nil)
-
-	info := []byte("reflag-key-derivation")
-	var okm []byte
-	var t []byte
-	counter := 1
-	for len(okm) < length {
-		data := append(append(t, info...), byte(counter))
-		h := hmac.New(sha256.New, prk)
-		h.Write(data)
-		t = h.Sum(nil)
-		okm = append(okm, t...)
-		counter++
-	}
-	return okm[:length]
-}
-
 // decryptPayload decrypts a base64-encoded nonce+ciphertext using AES-256-GCM.
 func decryptPayload(encoded string, transportKey []byte) ([]byte, error) {
-	combined, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode base64: %w", err)
-	}
-
-	block, err := aes.NewCipher(transportKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create cipher: %w", err)
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create GCM: %w", err)
-	}
-
-	nonceSize := gcm.NonceSize()
-	if len(combined) < nonceSize {
-		return nil, fmt.Errorf("ciphertext too short")
-	}
-
-	nonce := combined[:nonceSize]
-	ciphertext := combined[nonceSize:]
-
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt: %w", err)
-	}
-
-	return plaintext, nil
+	return crypto.DecryptPayload(encoded, transportKey)
 }
 
 // fetchSecrets calls the Reflag bulk resolve endpoint and decrypts the response.
@@ -312,7 +252,7 @@ func fetchSecrets(apiURL, apiKey string) (map[string]string, error) {
 
 	if rawResp.Encrypted {
 		// Decrypt the payload using a key derived from the API key
-		transportKey := deriveTransportKey(apiKey)
+		transportKey := crypto.DeriveTransportKey(apiKey)
 		plaintext, err := decryptPayload(rawResp.Payload, transportKey)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decrypt response: %w", err)
@@ -426,6 +366,3 @@ func isLocalhost(apiURL string) bool {
 	host := u.Hostname()
 	return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "0.0.0.0"
 }
-
-// suppress unused import warning for crypto/rand (used indirectly via the transport crypto)
-var _ = rand.Reader
