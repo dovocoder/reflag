@@ -415,6 +415,24 @@ func (s *Store) GetSegment(id string) (*models.Segment, error) {
 	return &seg, nil
 }
 
+// GetSegmentByKey returns a segment by key.
+func (s *Store) GetSegmentByKey(key string) (*models.Segment, error) {
+	var seg models.Segment
+	var conditionsStr string
+	err := s.db.QueryRow(`SELECT id, key, name, description, conditions, created_at, updated_at FROM segments WHERE key = ?`, key).
+		Scan(&seg.ID, &seg.Key, &seg.Name, &seg.Description, &conditionsStr, &seg.CreatedAt, &seg.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(conditionsStr), &seg.Conditions); err != nil {
+		return nil, err
+	}
+	return &seg, nil
+}
+
 // --- API Keys ---
 
 func (s *Store) CreateAPIKey(key *models.APIKey) error {

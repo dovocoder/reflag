@@ -26,7 +26,7 @@ type regexCacheEntry struct {
 
 var (
 	regexCacheEntries = make(map[string]regexCacheEntry)
-	regexCacheMu     sync.RWMutex
+	regexCacheMu      sync.RWMutex
 )
 
 func compileRegex(pattern string) (*regexp.Regexp, bool) {
@@ -78,26 +78,30 @@ const (
 
 // Error codes per OpenFeature specification section 2.5.5
 const (
-	ErrProviderNotReady  = "PROVIDER_NOT_READY"
-	ErrProviderFatal     = "PROVIDER_FATAL"
-	ErrFlagNotFound      = "FLAG_NOT_FOUND"
-	ErrParseError        = "PARSE_ERROR"
-	ErrTypeMismatch      = "TYPE_MISMATCH"
-	ErrInvalidContext    = "INVALID_CONTEXT"
-	ErrGeneral           = "GENERAL"
-	ErrSecretNotFound    = "SECRET_NOT_FOUND"
-	ErrSecretResolution  = "SECRET_RESOLUTION_FAILED"
+	ErrProviderNotReady = "PROVIDER_NOT_READY"
+	ErrProviderFatal    = "PROVIDER_FATAL"
+	ErrFlagNotFound     = "FLAG_NOT_FOUND"
+	ErrParseError       = "PARSE_ERROR"
+	ErrTypeMismatch     = "TYPE_MISMATCH"
+	ErrInvalidContext   = "INVALID_CONTEXT"
+	ErrGeneral          = "GENERAL"
+	ErrSecretNotFound   = "SECRET_NOT_FOUND"
+	ErrSecretResolution = "SECRET_RESOLUTION_FAILED"
 )
 
 // FlagMetadata keys
 const (
-	MetaFlagKey      = "flagKey"
-	MetaFlagVersion  = "version"
-	MetaEnvironment  = "environment"
+	MetaFlagKey     = "flagKey"
+	MetaFlagVersion = "version"
+	MetaEnvironment = "environment"
 )
 
 // SecretResolver resolves a secret key to its decrypted value.
 type SecretResolver func(key string) (string, error)
+
+// SegmentResolver looks up a segment's conditions by ID or key.
+// The boolean return value indicates whether the segment was found.
+type SegmentResolver func(id string) ([]models.Condition, bool)
 
 // EvaluationContext provides evaluation-time metadata per OpenFeature spec section 2.2.
 type EvaluationContext struct {
@@ -117,15 +121,15 @@ type ResolutionDetail struct {
 
 // EvaluationRequest is the standard request for flag evaluation.
 type EvaluationRequest struct {
-	FlagKey      string             `json:"flagKey"`
+	FlagKey      string            `json:"flagKey"`
 	DefaultValue any               `json:"defaultValue"`
-	Environment  string             `json:"environment,omitempty"`
-	Context      EvaluationContext  `json:"context,omitempty"`
+	Environment  string            `json:"environment,omitempty"`
+	Context      EvaluationContext `json:"context,omitempty"`
 }
 
 // Evaluate resolves a flag against the given evaluation context.
 // This implements the OpenFeature evaluation logic per spec sections 2.3-2.5.
-func Evaluate(flag *models.Flag, envKey string, ctx EvaluationContext) ResolutionDetail {
+func Evaluate(flag *models.Flag, envKey string, ctx EvaluationContext, resolveSegment SegmentResolver) ResolutionDetail {
 	// Build flag metadata
 	metadata := map[string]any{
 		MetaFlagKey: flag.Key,
@@ -156,9 +160,11 @@ func Evaluate(flag *models.Flag, envKey string, ctx EvaluationContext) Resolutio
 		}
 	}
 
-	// Try targeting rules first (in order — first match wins)
+	// Try targeting rules first (in order — first match wins).
+	// A rule matches when both its inline conditions and all referenced
+	// segment conditions evaluate to true.
 	for _, rule := range flag.Targeting {
-		if matchesAllConditions(rule.Conditions, ctx) {
+		if ruleMatches(rule, ctx, resolveSegment) {
 			return ResolutionDetail{
 				Value:        getVariationValueByID(flag, rule.VariationID),
 				Variant:      getVariationLabelByID(flag, rule.VariationID),
@@ -198,8 +204,8 @@ func Evaluate(flag *models.Flag, envKey string, ctx EvaluationContext) Resolutio
 
 // EvaluateWithType resolves a flag and validates the return type matches the expected type.
 // Returns TYPE_MISMATCH error if the resolved value doesn't match the requested type.
-func EvaluateWithType(flag *models.Flag, envKey string, ctx EvaluationContext, expectedType models.FlagType) ResolutionDetail {
-	detail := Evaluate(flag, envKey, ctx)
+func EvaluateWithType(flag *models.Flag, envKey string, ctx EvaluationContext, expectedType models.FlagType, resolveSegment SegmentResolver) ResolutionDetail {
+	detail := Evaluate(flag, envKey, ctx, resolveSegment)
 
 	// Don't type-check errors
 	if detail.Reason == ReasonError {
@@ -221,8 +227,8 @@ func EvaluateWithType(flag *models.Flag, envKey string, ctx EvaluationContext, e
 }
 
 // EvaluateWithSecrets resolves a flag and resolves any secret references.
-func EvaluateWithSecrets(flag *models.Flag, envKey string, ctx EvaluationContext, resolver SecretResolver) ResolutionDetail {
-	detail := Evaluate(flag, envKey, ctx)
+func EvaluateWithSecrets(flag *models.Flag, envKey string, ctx EvaluationContext, resolveSegment SegmentResolver, resolver SecretResolver) ResolutionDetail {
+	detail := Evaluate(flag, envKey, ctx, resolveSegment)
 	if resolver == nil || detail.Value == nil || detail.Reason == ReasonError {
 		return detail
 	}
@@ -296,6 +302,32 @@ func matchesAllConditions(conditions []models.Condition, ctx EvaluationContext) 
 	for _, cond := range conditions {
 		if !matchesCondition(cond, ctx) {
 			return false
+		}
+	}
+	return true
+}
+
+// ruleMatches determines whether a targeting rule applies to the given context.
+// A rule matches when its inline conditions (if any) and all referenced segment
+// conditions (if any) evaluate to true. Missing segments cause the rule to fail.
+func ruleMatches(rule models.TargetingRule, ctx EvaluationContext, resolveSegment SegmentResolver) bool {
+	hasInline := len(rule.Conditions) > 0
+	hasSegments := len(rule.SegmentIDs) > 0
+	if !hasInline && !hasSegments {
+		return false
+	}
+	if hasInline && !matchesAllConditions(rule.Conditions, ctx) {
+		return false
+	}
+	if hasSegments {
+		if resolveSegment == nil {
+			return false
+		}
+		for _, sid := range rule.SegmentIDs {
+			conds, ok := resolveSegment(sid)
+			if !ok || !matchesAllConditions(conds, ctx) {
+				return false
+			}
 		}
 	}
 	return true

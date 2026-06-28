@@ -30,6 +30,22 @@ func NewHandler(s *store.Store, a *auth.AuthService, secretsKey string) *Handler
 	}
 }
 
+// segmentResolver returns a function that loads segment conditions by ID or
+// key. Missing segments resolve to false, causing rules that reference them to
+// fail open (fall through to the default rule).
+func (h *Handler) segmentResolver() openfeature.SegmentResolver {
+	return func(id string) ([]models.Condition, bool) {
+		seg, _ := h.store.GetSegment(id)
+		if seg == nil {
+			seg, _ = h.store.GetSegmentByKey(id)
+		}
+		if seg == nil {
+			return nil, false
+		}
+		return seg.Conditions, true
+	}
+}
+
 // RegisterRoutes sets up all API routes on the given mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, loginLimiter *middleware.RateLimiter) {
 	// Public routes (no auth)
@@ -347,7 +363,7 @@ func (h *Handler) evaluateFlagType(w http.ResponseWriter, r *http.Request, expec
 		}
 	}
 
-	detail := openfeature.EvaluateWithType(flag, req.Environment, req.Context, expectedType)
+	detail := openfeature.EvaluateWithType(flag, req.Environment, req.Context, expectedType, h.segmentResolver())
 	detail = h.resolveSecretRefs(r, flag, detail)
 	// Re-validate type after secret resolution (secret value may have different type)
 	if detail.Reason != openfeature.ReasonError && detail.Value != nil {
@@ -424,7 +440,7 @@ func (h *Handler) evaluateFlagInternal(w http.ResponseWriter, r *http.Request, r
 		}
 	}
 
-	detail := openfeature.Evaluate(flag, req.Environment, req.Context)
+	detail := openfeature.Evaluate(flag, req.Environment, req.Context, h.segmentResolver())
 	detail = h.resolveSecretRefs(r, flag, detail)
 
 	// On error, return the defaultValue from the request
@@ -499,6 +515,11 @@ func (h *Handler) createFlag(w http.ResponseWriter, r *http.Request) {
 	// R8-H1/H2/H3/M5: Validate flag configuration consistency
 	if msg := validateFlagConfig(&flag); msg != "" {
 		middleware.JSONError(w, http.StatusBadRequest, msg)
+		return
+	}
+	// R17-L1: Validate segment references exist at creation time.
+	if err := h.validateSegments(&flag); err != nil {
+		middleware.JSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if len(flag.Name) > 256 {
@@ -588,6 +609,11 @@ func (h *Handler) updateFlag(w http.ResponseWriter, r *http.Request) {
 	// R8-H1/H2/H3/M5: Validate flag configuration consistency after merge
 	if msg := validateFlagConfig(existing); msg != "" {
 		middleware.JSONError(w, http.StatusBadRequest, msg)
+		return
+	}
+	// R17-L1: Validate segment references exist after updates.
+	if err := h.validateSegments(existing); err != nil {
+		middleware.JSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if err := h.store.UpdateFlag(existing); err != nil {
@@ -1209,6 +1235,31 @@ func validateFlagConfig(flag *models.Flag) string {
 		}
 	}
 	return ""
+}
+
+// validateSegments checks that every segment_id referenced by a targeting rule
+// exists in the store. Segment references may use the segment ID or key.
+func (h *Handler) validateSegments(flag *models.Flag) error {
+	seen := make(map[string]bool)
+	for _, rule := range flag.Targeting {
+		for _, sid := range rule.SegmentIDs {
+			if sid == "" {
+				return fmt.Errorf("targeting rule %q references an empty segment", rule.Name)
+			}
+			if seen[sid] {
+				continue
+			}
+			seg, _ := h.store.GetSegment(sid)
+			if seg == nil {
+				seg, _ = h.store.GetSegmentByKey(sid)
+			}
+			if seg == nil {
+				return fmt.Errorf("segment %q referenced by targeting rule %q does not exist", sid, rule.Name)
+			}
+			seen[sid] = true
+		}
+	}
+	return nil
 }
 
 // isValidFlagKey validates that a flag key contains only safe characters.

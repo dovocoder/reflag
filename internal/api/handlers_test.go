@@ -266,3 +266,73 @@ func TestOrganizationRBAC(t *testing.T) {
 		t.Fatalf("expected 403 deleting org as viewer, got %d", delResp.StatusCode)
 	}
 }
+
+func TestEvaluateFlagWithSegment(t *testing.T) {
+	te := setupTestHandler(t)
+
+	seg := &models.Segment{
+		ID:   uuid.New().String(),
+		Key:  "beta-users",
+		Name: "Beta Users",
+		Conditions: []models.Condition{{
+			ID:        "c1",
+			Attribute: "email",
+			Operator:  "ends_with",
+			Values:    []string{"@beta.com"},
+		}},
+	}
+	if err := te.store.CreateSegment(seg); err != nil {
+		t.Fatalf("create segment: %v", err)
+	}
+
+	flag := &models.Flag{
+		ID:      uuid.New().String(),
+		Key:     "beta-feature",
+		Name:    "Beta Feature",
+		Type:    models.FlagTypeString,
+		Enabled: true,
+		Version: 1,
+		Variations: []models.Variation{
+			{ID: "v-default", Label: "Default", Value: json.RawMessage(`"default"`)},
+			{ID: "v-beta", Label: "Beta", Value: json.RawMessage(`"beta-enabled"`)},
+		},
+		DefaultRule: &models.DefaultRule{VariationID: "v-default"},
+		Targeting: []models.TargetingRule{{
+			ID:          "rule-1",
+			Name:        "beta users",
+			SegmentIDs:  []string{seg.ID},
+			VariationID: "v-beta",
+		}},
+	}
+	if err := te.store.CreateFlag(flag); err != nil {
+		t.Fatalf("create flag: %v", err)
+	}
+
+	adminUser := &models.User{ID: "admin", Email: testAdminEmail, Name: "Admin", Role: "admin"}
+	token, err := te.auth.GenerateJWT(adminUser)
+	if err != nil {
+		t.Fatalf("generate admin jwt: %v", err)
+	}
+
+	makeRequest := func(email string) string {
+		body := map[string]any{
+			"flagKey": "beta-feature",
+			"context": map[string]any{
+				"attributes": map[string]any{"email": email},
+			},
+		}
+		detail := te.evaluate(t, "Authorization", "Bearer "+token, body)
+		if detail.Reason == openfeature.ReasonError {
+			t.Fatalf("evaluation error: %s - %s", detail.ErrorCode, detail.ErrorMessage)
+		}
+		v, _ := detail.Value.(string)
+		return v
+	}
+
+	if v := makeRequest("alice@beta.com"); v != "beta-enabled" {
+		t.Fatalf("expected beta-enabled, got %q", v)
+	}
+	if v := makeRequest("alice@other.com"); v != "default" {
+		t.Fatalf("expected default, got %q", v)
+	}
+}

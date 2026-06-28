@@ -59,9 +59,10 @@ type Variation struct {
 
 // TargetingRule defines conditional evaluation logic.
 type TargetingRule struct {
-	ID         string        `json:"id"`
-	Name       string        `json:"name"`
-	Conditions []Condition   `json:"conditions"`
+	ID          string      `json:"id"`
+	Name        string      `json:"name"`
+	Conditions  []Condition `json:"conditions"`
+	SegmentIDs  []string    `json:"segment_ids,omitempty"`
 	VariationID string      `json:"variation_id"`
 }
 
