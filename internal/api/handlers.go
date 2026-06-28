@@ -87,15 +87,6 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, loginLimiter *middleware.Ra
 
 	adminMux.HandleFunc("GET /api/audit", h.listAuditEntries)
 
-	// Organizations
-	adminMux.HandleFunc("GET /api/organizations", h.listOrgs)
-	adminMux.HandleFunc("POST /api/organizations", h.createOrg)
-	adminMux.HandleFunc("DELETE /api/organizations/{id}", h.deleteOrg)
-	adminMux.HandleFunc("GET /api/organizations/{id}/members", h.listOrgMembers)
-	adminMux.HandleFunc("POST /api/organizations/{id}/members", h.addOrgMember)
-	adminMux.HandleFunc("PUT /api/organizations/members/{memberId}", h.updateOrgMemberRole)
-	adminMux.HandleFunc("DELETE /api/organizations/members/{memberId}", h.removeOrgMember)
-
 	// Secrets
 	adminMux.HandleFunc("GET /api/secrets", h.listSecrets)
 	adminMux.HandleFunc("POST /api/secrets", h.createSecret)
@@ -103,8 +94,22 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, loginLimiter *middleware.Ra
 	adminMux.HandleFunc("PUT /api/secrets/{id}", h.updateSecret)
 	adminMux.HandleFunc("DELETE /api/secrets/{id}", h.deleteSecret)
 
-	// All admin routes require JWT + admin/owner role
+	// Management routes that require global admin/owner role.
 	mux.Handle("/api/", h.auth.JWTMiddleware(h.auth.RequireRole("admin", "owner")(adminMux)))
+
+	// Organization routes: any authenticated user can list their own orgs and
+	// create one; per-handler checks enforce org admin/owner roles for
+	// membership management and deletion.
+	orgMux := http.NewServeMux()
+	orgMux.HandleFunc("GET /api/organizations", h.listOrgs)
+	orgMux.HandleFunc("POST /api/organizations", h.createOrg)
+	orgMux.HandleFunc("DELETE /api/organizations/{id}", h.deleteOrg)
+	orgMux.HandleFunc("GET /api/organizations/{id}/members", h.listOrgMembers)
+	orgMux.HandleFunc("POST /api/organizations/{id}/members", h.addOrgMember)
+	orgMux.HandleFunc("PUT /api/organizations/members/{memberId}", h.updateOrgMemberRole)
+	orgMux.HandleFunc("DELETE /api/organizations/members/{memberId}", h.removeOrgMember)
+	mux.Handle("/api/organizations", h.auth.JWTMiddleware(orgMux))
+	mux.Handle("/api/organizations/", h.auth.JWTMiddleware(orgMux))
 }
 
 // --- Health ---
@@ -912,7 +917,15 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 // --- Organizations ---
 
 func (h *Handler) listOrgs(w http.ResponseWriter, r *http.Request) {
-	orgs, err := h.store.ListOrgs()
+	// Global admins see all organizations; other users see only orgs they belong to.
+	user := auth.UserFromContext(r.Context())
+	var orgs []models.Organization
+	var err error
+	if user != nil && user.Role == "admin" {
+		orgs, err = h.store.ListOrgs()
+	} else if user != nil {
+		orgs, err = h.store.ListOrgsForUser(user.ID)
+	}
 	if err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "database error")
 		return
@@ -979,6 +992,15 @@ func (h *Handler) deleteOrg(w http.ResponseWriter, r *http.Request) {
 		middleware.JSONError(w, http.StatusNotFound, "organization not found")
 		return
 	}
+	// Only global admins or org owners/admins may delete an organization.
+	user := auth.UserFromContext(r.Context())
+	if user != nil && user.Role != "admin" {
+		role, err := h.store.GetUserOrgRole(user.ID, id)
+		if err != nil || (role != "owner" && role != "admin") {
+			middleware.JSONError(w, http.StatusForbidden, "insufficient permissions — must be org admin or owner")
+			return
+		}
+	}
 	if err := h.store.DeleteOrg(id); err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to delete org")
 		return
@@ -989,6 +1011,15 @@ func (h *Handler) deleteOrg(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) listOrgMembers(w http.ResponseWriter, r *http.Request) {
 	orgID := r.PathValue("id")
+	// Only global admins or members of the organization may list members.
+	user := auth.UserFromContext(r.Context())
+	if user != nil && user.Role != "admin" {
+		role, err := h.store.GetUserOrgRole(user.ID, orgID)
+		if err != nil || role == "" {
+			middleware.JSONError(w, http.StatusForbidden, "insufficient permissions")
+			return
+		}
+	}
 	members, err := h.store.ListOrgMembers(orgID)
 	if err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "database error")

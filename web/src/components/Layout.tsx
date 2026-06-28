@@ -16,13 +16,17 @@ const navItems = [
   { page: "segments", path: "/segments", label: "Segments", icon: Users, adminOnly: false },
   { page: "secrets", path: "/secrets", label: "Secrets", icon: Lock, adminOnly: true },
   { page: "api-keys", path: "/api-keys", label: "API Keys", icon: Key, adminOnly: true },
-  { page: "organizations", path: "/organizations", label: "Orgs", icon: Building2, adminOnly: true },
+  { page: "organizations", path: "/organizations", label: "Orgs", icon: Building2, adminOnly: false },
   { page: "audit", path: "/audit", label: "Audit", icon: ScrollText, adminOnly: true },
 ];
 
-export function Layout({ current, onNavigate, onLogout, userRole, children }: LayoutProps) {
+function getVisibleNav(userRole?: string) {
   const isAdmin = userRole === "admin" || userRole === "owner";
-  const visibleNav = navItems.filter(item => !item.adminOnly || isAdmin);
+  return navItems.filter(item => !item.adminOnly || isAdmin);
+}
+
+export function Layout({ current, onNavigate, onLogout, userRole, children }: LayoutProps) {
+  const visibleNav = getVisibleNav(userRole);
   return (
     <div className="min-h-screen flex">
       {/* Desktop Sidebar */}
@@ -66,7 +70,7 @@ export function Layout({ current, onNavigate, onLogout, userRole, children }: La
       {/* Mobile Header */}
       <div className="lg:hidden fixed top-0 left-0 right-0 z-50 bg-[var(--color-sidebar)] border-b border-[var(--color-sidebar-border)] h-14 flex items-center justify-between px-4">
         <h1 className="text-lg font-bold">🚩 Reflag</h1>
-        <MobileNav current={current} onNavigate={onNavigate} onLogout={onLogout} />
+        <MobileNav current={current} onNavigate={onNavigate} onLogout={onLogout} userRole={userRole} />
       </div>
 
       {/* Main Content */}
@@ -98,8 +102,9 @@ export function Layout({ current, onNavigate, onLogout, userRole, children }: La
   );
 }
 
-function MobileNav({ current, onNavigate, onLogout }: { current: string; onNavigate: (p: string) => void; onLogout: () => void }) {
+function MobileNav({ current, onNavigate, onLogout, userRole }: { current: string; onNavigate: (p: string) => void; onLogout: () => void; userRole?: string }) {
   const [open, setOpen] = React.useState(false);
+  const visibleNav = getVisibleNav(userRole);
   return (
     <>
       <button onClick={() => setOpen(!open)} className="p-2">

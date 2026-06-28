@@ -253,9 +253,9 @@ func (s *Store) DeleteEnvironment(id string) error {
 
 func (s *Store) CreateFlag(flag *models.Flag) error {
 	data, err := json.Marshal(flagData{
-		Variations:    flag.Variations,
-		Targeting:     flag.Targeting,
-		DefaultRule:  flag.DefaultRule,
+		Variations:  flag.Variations,
+		Targeting:   flag.Targeting,
+		DefaultRule: flag.DefaultRule,
 	})
 	if err != nil {
 		return err
@@ -295,9 +295,9 @@ func (s *Store) GetFlagByKey(key string) (*models.Flag, error) {
 
 func (s *Store) UpdateFlag(flag *models.Flag) error {
 	data, err := json.Marshal(flagData{
-		Variations:   flag.Variations,
-		Targeting:    flag.Targeting,
-		DefaultRule:  flag.DefaultRule,
+		Variations:  flag.Variations,
+		Targeting:   flag.Targeting,
+		DefaultRule: flag.DefaultRule,
 	})
 	if err != nil {
 		return err
@@ -644,9 +644,9 @@ func (s *Store) GetOrCreateUserBySub(sub, email, name string) (*models.User, err
 // --- Helpers ---
 
 type flagData struct {
-	Variations   []models.Variation     `json:"variations"`
-	Targeting    []models.TargetingRule `json:"targeting_rules"`
-	DefaultRule  *models.DefaultRule     `json:"default_rule,omitempty"`
+	Variations  []models.Variation     `json:"variations"`
+	Targeting   []models.TargetingRule `json:"targeting_rules"`
+	DefaultRule *models.DefaultRule    `json:"default_rule,omitempty"`
 }
 
 type scanner interface {
@@ -814,6 +814,25 @@ func (s *Store) CreateOrg(org *models.Organization) error {
 func (s *Store) ListOrgs() ([]models.Organization, error) {
 	// R15-M3: Limit results to prevent memory exhaustion DoS
 	rows, err := s.db.Query(`SELECT id, name, slug, description, created_at, updated_at FROM organizations ORDER BY created_at LIMIT 500`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var orgs []models.Organization
+	for rows.Next() {
+		var o models.Organization
+		if err := rows.Scan(&o.ID, &o.Name, &o.Slug, &o.Description, &o.CreatedAt, &o.UpdatedAt); err != nil {
+			return nil, err
+		}
+		orgs = append(orgs, o)
+	}
+	return orgs, nil
+}
+
+// ListOrgsForUser returns only the organizations a given user belongs to.
+func (s *Store) ListOrgsForUser(userID string) ([]models.Organization, error) {
+	rows, err := s.db.Query(`SELECT o.id, o.name, o.slug, o.description, o.created_at, o.updated_at
+		FROM organizations o JOIN org_members om ON om.org_id = o.id WHERE om.user_id = ? ORDER BY o.created_at LIMIT 500`, userID)
 	if err != nil {
 		return nil, err
 	}
