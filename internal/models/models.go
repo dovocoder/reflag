@@ -155,6 +155,7 @@ type Secret struct {
 	Description   string    `json:"description"`
 	EncryptedValue string   `json:"-"` // Never serialized to JSON
 	EnvironmentID string    `json:"environment_id,omitempty"`
+	Version       int       `json:"version"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }

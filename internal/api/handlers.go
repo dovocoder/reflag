@@ -1377,6 +1377,7 @@ func (h *Handler) createSecret(w http.ResponseWriter, r *http.Request) {
 		Description:    req.Description,
 		EncryptedValue: encrypted,
 		EnvironmentID:  req.EnvironmentID,
+		Version:        1,
 	}
 	if err := h.store.CreateSecret(secret); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
@@ -1394,6 +1395,7 @@ func (h *Handler) createSecret(w http.ResponseWriter, r *http.Request) {
 		"name":           secret.Name,
 		"description":    secret.Description,
 		"environment_id":  secret.EnvironmentID,
+		"version":         secret.Version,
 		"created_at":     secret.CreatedAt,
 	})
 }
@@ -1418,6 +1420,7 @@ func (h *Handler) getSecret(w http.ResponseWriter, r *http.Request) {
 		"description":   secret.Description,
 		"value":         decrypted,
 		"environment_id": secret.EnvironmentID,
+		"version":       secret.Version,
 		"created_at":    secret.CreatedAt,
 		"updated_at":    secret.UpdatedAt,
 	})
@@ -1486,7 +1489,13 @@ func (h *Handler) updateSecret(w http.ResponseWriter, r *http.Request) {
 		existing.EnvironmentID = req.EnvironmentID
 	}
 
+	// Optimistic concurrency: pass the version we read (before increment)
+	// The SQL UPDATE uses WHERE version = <original> and sets version = version+1
 	if err := h.store.UpdateSecret(existing); err != nil {
+		if strings.Contains(err.Error(), "concurrent modification") {
+			middleware.JSONError(w, http.StatusConflict, "secret was modified by another request — please retry")
+			return
+		}
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to update secret")
 		return
 	}
@@ -1497,6 +1506,7 @@ func (h *Handler) updateSecret(w http.ResponseWriter, r *http.Request) {
 		"name":          existing.Name,
 		"description":   existing.Description,
 		"environment_id": existing.EnvironmentID,
+		"version":       existing.Version + 1,
 		"updated_at":    existing.UpdatedAt,
 	})
 }

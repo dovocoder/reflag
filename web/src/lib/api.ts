@@ -15,9 +15,11 @@ export function setToken(_token: string) {
 }
 
 export function isAuthenticated(): boolean {
-  // We can't check the HttpOnly cookie from JS — assume authenticated.
-  // The server will return 401 if not authenticated, redirecting to /login.
-  return true;
+  // R15-M4: Check if we have a role in sessionStorage as a proxy for auth state.
+  // The JWT is in an HttpOnly cookie (not readable by JS), so we use the role
+  // as a signal that login has occurred. The server still enforces auth on
+  // every API request — this is only a client-side UX optimization.
+  return sessionStorage.getItem("reflag_role") !== null;
 }
 
 async function request<T>(

@@ -113,6 +113,7 @@ func (s *Store) migrate() error {
 			description TEXT DEFAULT '',
 			encrypted_value TEXT NOT NULL,
 			environment_id TEXT REFERENCES environments(id) ON DELETE SET NULL,
+			version INTEGER NOT NULL DEFAULT 1,
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
@@ -158,7 +159,7 @@ func (s *Store) migrate() error {
 				}
 			}
 		}
-		rows.Close()
+		rows.Close() // Close immediately — SetMaxOpenConns(1) requires no pending rows before next query
 	}
 	if !hasVersion {
 		if _, err := s.db.Exec(`ALTER TABLE flags ADD COLUMN version INTEGER NOT NULL DEFAULT 1`); err != nil {
@@ -181,6 +182,19 @@ func (s *Store) migrate() error {
 	// Create unique index on oidc_sub (conditional — SQLite doesn't support IF NOT EXISTS on CREATE UNIQUE INDEX before 3.8)
 	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oidc_sub ON users(oidc_sub) WHERE oidc_sub IS NOT NULL`); err != nil {
 		return fmt.Errorf("create oidc_sub index: %w", err)
+	}
+	// R15-M1: Add version column to secrets for optimistic concurrency
+	if _, err := s.db.Exec(`ALTER TABLE secrets ADD COLUMN version INTEGER NOT NULL DEFAULT 1`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("alter secrets table (add version): %w", err)
+		}
+	}
+	// R15-M2: Add missing indexes for query performance
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_org_members_org_id ON org_members(org_id)`); err != nil {
+		return fmt.Errorf("create org_members_org_id index: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_secrets_env ON secrets(environment_id)`); err != nil {
+		return fmt.Errorf("create secrets_env index: %w", err)
 	}
 	return nil
 }
@@ -252,7 +266,8 @@ func (s *Store) CreateFlag(flag *models.Flag) error {
 }
 
 func (s *Store) ListFlags() ([]models.Flag, error) {
-	rows, err := s.db.Query(`SELECT id, key, name, description, type, enabled, version, data, created_at, updated_at FROM flags ORDER BY created_at DESC`)
+	// R15-M3: Limit results to prevent memory exhaustion DoS
+	rows, err := s.db.Query(`SELECT id, key, name, description, type, enabled, version, data, created_at, updated_at FROM flags ORDER BY created_at DESC LIMIT 500`)
 	if err != nil {
 		return nil, err
 	}
@@ -356,7 +371,8 @@ func (s *Store) CreateSegment(seg *models.Segment) error {
 }
 
 func (s *Store) ListSegments() ([]models.Segment, error) {
-	rows, err := s.db.Query(`SELECT id, key, name, description, conditions, created_at, updated_at FROM segments ORDER BY created_at DESC`)
+	// R15-M3: Limit results to prevent memory exhaustion DoS
+	rows, err := s.db.Query(`SELECT id, key, name, description, conditions, created_at, updated_at FROM segments ORDER BY created_at DESC LIMIT 500`)
 	if err != nil {
 		return nil, err
 	}
@@ -420,7 +436,8 @@ func (s *Store) CreateAPIKey(key *models.APIKey) error {
 }
 
 func (s *Store) ListAPIKeys() ([]models.APIKey, error) {
-	rows, err := s.db.Query(`SELECT id, name, key_prefix, environment_id, scopes, last_used_at, expires_at, created_at, revoked FROM api_keys ORDER BY created_at DESC`)
+	// R15-M3: Limit results to prevent memory exhaustion DoS
+	rows, err := s.db.Query(`SELECT id, name, key_prefix, environment_id, scopes, last_used_at, expires_at, created_at, revoked FROM api_keys ORDER BY created_at DESC LIMIT 500`)
 	if err != nil {
 		return nil, err
 	}
@@ -676,13 +693,14 @@ func (s *Store) CreateSecret(secret *models.Secret) error {
 	if secret.EnvironmentID != "" {
 		envID = secret.EnvironmentID
 	}
-	_, err := s.db.Exec(`INSERT INTO secrets (id, key, name, description, encrypted_value, environment_id) VALUES (?, ?, ?, ?, ?, ?)`,
-		secret.ID, secret.Key, secret.Name, secret.Description, secret.EncryptedValue, envID)
+	_, err := s.db.Exec(`INSERT INTO secrets (id, key, name, description, encrypted_value, environment_id, version) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		secret.ID, secret.Key, secret.Name, secret.Description, secret.EncryptedValue, envID, secret.Version)
 	return err
 }
 
 func (s *Store) ListSecrets() ([]models.Secret, error) {
-	rows, err := s.db.Query(`SELECT id, key, name, description, encrypted_value, environment_id, created_at, updated_at FROM secrets ORDER BY created_at DESC`)
+	// R15-M3: Limit results to prevent memory exhaustion DoS
+	rows, err := s.db.Query(`SELECT id, key, name, description, encrypted_value, environment_id, version, created_at, updated_at FROM secrets ORDER BY created_at DESC LIMIT 500`)
 	if err != nil {
 		return nil, err
 	}
@@ -691,7 +709,7 @@ func (s *Store) ListSecrets() ([]models.Secret, error) {
 	for rows.Next() {
 		var sec models.Secret
 		var envID sql.NullString
-		if err := rows.Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &envID, &sec.CreatedAt, &sec.UpdatedAt); err != nil {
+		if err := rows.Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &envID, &sec.Version, &sec.CreatedAt, &sec.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if envID.Valid {
@@ -706,7 +724,7 @@ func (s *Store) ListSecrets() ([]models.Secret, error) {
 // R12-M2: More efficient and prevents information leakage via timing when
 // resolveAllSecrets only needs secrets for one environment.
 func (s *Store) ListSecretsByEnvironment(envID string) ([]models.Secret, error) {
-	rows, err := s.db.Query(`SELECT id, key, name, description, encrypted_value, environment_id, created_at, updated_at FROM secrets WHERE environment_id = ? ORDER BY created_at DESC`, envID)
+	rows, err := s.db.Query(`SELECT id, key, name, description, encrypted_value, environment_id, version, created_at, updated_at FROM secrets WHERE environment_id = ? ORDER BY created_at DESC`, envID)
 	if err != nil {
 		return nil, err
 	}
@@ -715,7 +733,7 @@ func (s *Store) ListSecretsByEnvironment(envID string) ([]models.Secret, error) 
 	for rows.Next() {
 		var sec models.Secret
 		var envIDStr sql.NullString
-		if err := rows.Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &envIDStr, &sec.CreatedAt, &sec.UpdatedAt); err != nil {
+		if err := rows.Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &envIDStr, &sec.Version, &sec.CreatedAt, &sec.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if envIDStr.Valid {
@@ -729,8 +747,8 @@ func (s *Store) ListSecretsByEnvironment(envID string) ([]models.Secret, error) 
 func (s *Store) GetSecret(id string) (*models.Secret, error) {
 	var sec models.Secret
 	var envID sql.NullString
-	err := s.db.QueryRow(`SELECT id, key, name, description, encrypted_value, environment_id, created_at, updated_at FROM secrets WHERE id = ?`, id).
-		Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &envID, &sec.CreatedAt, &sec.UpdatedAt)
+	err := s.db.QueryRow(`SELECT id, key, name, description, encrypted_value, environment_id, version, created_at, updated_at FROM secrets WHERE id = ?`, id).
+		Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &envID, &sec.Version, &sec.CreatedAt, &sec.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -746,8 +764,8 @@ func (s *Store) GetSecret(id string) (*models.Secret, error) {
 func (s *Store) GetSecretByKey(key string) (*models.Secret, error) {
 	var sec models.Secret
 	var envID sql.NullString
-	err := s.db.QueryRow(`SELECT id, key, name, description, encrypted_value, environment_id, created_at, updated_at FROM secrets WHERE key = ?`, key).
-		Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &envID, &sec.CreatedAt, &sec.UpdatedAt)
+	err := s.db.QueryRow(`SELECT id, key, name, description, encrypted_value, environment_id, version, created_at, updated_at FROM secrets WHERE key = ?`, key).
+		Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &envID, &sec.Version, &sec.CreatedAt, &sec.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -766,9 +784,18 @@ func (s *Store) UpdateSecret(secret *models.Secret) error {
 	if secret.EnvironmentID != "" {
 		envID = secret.EnvironmentID
 	}
-	_, err := s.db.Exec(`UPDATE secrets SET key=?, name=?, description=?, encrypted_value=?, environment_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-		secret.Key, secret.Name, secret.Description, secret.EncryptedValue, envID, secret.ID)
-	return err
+	// R15-M1: Optimistic concurrency control — WHERE includes version
+	// to prevent lost-update race when two concurrent PATCH requests modify the same secret
+	result, err := s.db.Exec(`UPDATE secrets SET key=?, name=?, description=?, encrypted_value=?, environment_id=?, version=version+1, updated_at=CURRENT_TIMESTAMP WHERE id=? AND version=?`,
+		secret.Key, secret.Name, secret.Description, secret.EncryptedValue, envID, secret.ID, secret.Version)
+	if err != nil {
+		return err
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("concurrent modification detected")
+	}
+	return nil
 }
 
 func (s *Store) DeleteSecret(id string) error {
@@ -785,7 +812,8 @@ func (s *Store) CreateOrg(org *models.Organization) error {
 }
 
 func (s *Store) ListOrgs() ([]models.Organization, error) {
-	rows, err := s.db.Query(`SELECT id, name, slug, description, created_at, updated_at FROM organizations ORDER BY created_at`)
+	// R15-M3: Limit results to prevent memory exhaustion DoS
+	rows, err := s.db.Query(`SELECT id, name, slug, description, created_at, updated_at FROM organizations ORDER BY created_at LIMIT 500`)
 	if err != nil {
 		return nil, err
 	}
