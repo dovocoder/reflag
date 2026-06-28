@@ -9,9 +9,59 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/dovocoder/reflag/internal/models"
 )
+
+// R9-H3: Cache compiled regex patterns to prevent CPU exhaustion DoS.
+// Without caching, each eval request with a regex condition recompiles the pattern.
+// compileRegex returns a compiled regex from cache, or compiles and caches it.
+// Patterns longer than 500 chars are rejected. Cache entries expire after 10 minutes.
+type regexCacheEntry struct {
+	re      *regexp.Regexp
+	expires time.Time
+}
+
+var (
+	regexCacheEntries = make(map[string]regexCacheEntry)
+	regexCacheMu     sync.RWMutex
+)
+
+func compileRegex(pattern string) (*regexp.Regexp, bool) {
+	regexCacheMu.RLock()
+	entry, ok := regexCacheEntries[pattern]
+	regexCacheMu.RUnlock()
+	if ok && time.Now().Before(entry.expires) {
+		return entry.re, true
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, false
+	}
+	regexCacheMu.Lock()
+	// Prevent unbounded cache growth — cap at 1000 entries
+	if len(regexCacheEntries) >= 1000 {
+		// Evict expired entries
+		now := time.Now()
+		for k, e := range regexCacheEntries {
+			if !now.Before(e.expires) {
+				delete(regexCacheEntries, k)
+			}
+		}
+		// If still full, clear all
+		if len(regexCacheEntries) >= 1000 {
+			regexCacheEntries = make(map[string]regexCacheEntry)
+		}
+	}
+	regexCacheEntries[pattern] = regexCacheEntry{
+		re:      re,
+		expires: time.Now().Add(10 * time.Minute),
+	}
+	regexCacheMu.Unlock()
+	return re, true
+}
 
 // --- OpenFeature spec constants ---
 
@@ -385,8 +435,8 @@ func matchesCondition(cond models.Condition, ctx EvaluationContext) bool {
 			if len(v) > 500 {
 				continue // reject overly long patterns
 			}
-			re, err := regexp.Compile(v)
-			if err == nil && re.MatchString(attrStr) {
+			re, ok := compileRegex(v)
+			if ok && re.MatchString(attrStr) {
 				return true
 			}
 		}

@@ -336,6 +336,11 @@ func (a *AuthService) ExchangeCode(code, codeVerifier string) (*models.User, str
 	if codeVerifier != "" {
 		data.Set("code_verifier", codeVerifier)
 	}
+	// R9-M1: PKCE verifier must be present — without it, the token exchange
+	// is vulnerable to authorization code interception attacks (RFC 7636).
+	if codeVerifier == "" {
+		return nil, "", fmt.Errorf("PKCE verifier required for token exchange")
+	}
 	resp, err := a.httpClient.PostForm(d.TokenEndpoint, data)
 	if err != nil {
 		return nil, "", fmt.Errorf("token exchange failed: %w", err)
@@ -385,10 +390,11 @@ func (a *AuthService) ExchangeCode(code, codeVerifier string) (*models.User, str
 
 	// Use sub as the primary identity — email is mutable and can be reused.
 	// sub is the cryptographically verified subject identifier from the IdP.
+	// R9-H1: Actually use sub for user lookup, not just validation.
 	if info.Sub == "" {
 		return nil, "", fmt.Errorf("OIDC userinfo missing sub claim")
 	}
-	user, err := a.store.GetOrCreateUser(info.Email, info.Name)
+	user, err := a.store.GetOrCreateUserBySub(info.Sub, info.Email, info.Name)
 	if err != nil {
 		return nil, "", err
 	}

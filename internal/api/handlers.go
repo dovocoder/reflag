@@ -167,6 +167,11 @@ func (h *Handler) oidcCallback(w http.ResponseWriter, r *http.Request) {
 		middleware.JSONError(w, http.StatusBadRequest, "state is required")
 		return
 	}
+	// R9-M4: Validate authorization code is present
+	if req.Code == "" {
+		middleware.JSONError(w, http.StatusBadRequest, "code is required")
+		return
+	}
 	cookieState, err := r.Cookie("reflag_oidc_state")
 	if err != nil || cookieState.Value == "" {
 		middleware.JSONError(w, http.StatusBadRequest, "missing state cookie")
@@ -636,6 +641,10 @@ func (h *Handler) createEnvironment(w http.ResponseWriter, r *http.Request) {
 		middleware.JSONError(w, http.StatusBadRequest, "key must be alphanumeric with dashes/underscores, max 128 chars")
 		return
 	}
+	if len(env.Name) > 256 {
+		middleware.JSONError(w, http.StatusBadRequest, "name too long (max 256 chars)")
+		return
+	}
 	env.ID = uuid.New().String()
 	if err := h.store.CreateEnvironment(&env); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
@@ -691,6 +700,10 @@ func (h *Handler) createSegment(w http.ResponseWriter, r *http.Request) {
 	}
 	if !isValidKey(seg.Key) {
 		middleware.JSONError(w, http.StatusBadRequest, "key must be alphanumeric with dashes/underscores, max 128 chars")
+		return
+	}
+	if len(seg.Name) > 256 {
+		middleware.JSONError(w, http.StatusBadRequest, "name too long (max 256 chars)")
 		return
 	}
 	seg.ID = uuid.New().String()
@@ -1142,6 +1155,14 @@ func validateFlagConfig(flag *models.Flag) string {
 			return fmt.Sprintf("default_rule references unknown variation: %s", flag.DefaultRule.VariationID)
 		}
 	}
+	// R9-H2: Validate percentage map keys reference existing variations
+	if flag.DefaultRule != nil && len(flag.DefaultRule.Percentage) > 0 {
+		for varID := range flag.DefaultRule.Percentage {
+			if !seen[varID] {
+				return fmt.Sprintf("percentage references unknown variation: %s", varID)
+			}
+		}
+	}
 	// Validate targeting rules reference existing variations
 	for _, rule := range flag.Targeting {
 		if rule.VariationID != "" && !seen[rule.VariationID] {
@@ -1534,9 +1555,9 @@ func (h *Handler) resolveAllSecrets(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		result[s.Key] = decrypted
-		// Audit individual secret resolution
-		h.audit(auth.ActorFromContext(r.Context()), "RESOLVE", "secret", s.ID, s.Key)
 	}
+	// R9-M5: Batch audit — single entry instead of one per secret
+	h.audit(auth.ActorFromContext(r.Context()), "RESOLVE_ALL", "secrets", "", fmt.Sprintf("resolved %d secrets", len(result)))
 	h.writeEncrypted(w, r, result)
 }
 

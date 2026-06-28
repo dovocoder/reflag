@@ -117,10 +117,11 @@ type AuditLogEntry struct {
 
 // User represents an authenticated admin user (from OIDC or hardcoded admin).
 type User struct {
-	ID    string `json:"id"`
-	Email string `json:"email"`
-	Name  string `json:"name"`
-	Role  string `json:"role"` // admin, owner, member, viewer
+	ID      string `json:"id"`
+	Email   string `json:"email"`
+	Name    string `json:"name"`
+	Role    string `json:"role"` // admin, owner, member, viewer
+	OIDCSub string `json:"-"`
 }
 
 // Organization represents a tenant/workspace that owns flags, secrets, etc.

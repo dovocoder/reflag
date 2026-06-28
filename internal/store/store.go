@@ -103,6 +103,7 @@ func (s *Store) migrate() error {
 			email TEXT UNIQUE NOT NULL,
 			name TEXT NOT NULL,
 			role TEXT NOT NULL DEFAULT 'member',
+			oidc_sub TEXT UNIQUE DEFAULT NULL,
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE TABLE IF NOT EXISTS secrets (
@@ -170,6 +171,16 @@ func (s *Store) migrate() error {
 		if !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("alter users table (add role): %w", err)
 		}
+	}
+	// R9-H1: Add oidc_sub column for OIDC identity-based user lookup
+	if _, err := s.db.Exec(`ALTER TABLE users ADD COLUMN oidc_sub TEXT DEFAULT NULL`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("alter users table (add oidc_sub): %w", err)
+		}
+	}
+	// Create unique index on oidc_sub (conditional — SQLite doesn't support IF NOT EXISTS on CREATE UNIQUE INDEX before 3.8)
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oidc_sub ON users(oidc_sub) WHERE oidc_sub IS NOT NULL`); err != nil {
+		return fmt.Errorf("create oidc_sub index: %w", err)
 	}
 	return nil
 }
@@ -570,6 +581,56 @@ func (s *Store) GetOrCreateUser(email, name string) (*models.User, error) {
 	return &u, nil
 }
 
+// GetOrCreateUserBySub looks up a user by their OIDC sub claim.
+// If the user doesn't exist by sub, creates one. If the email is already
+// registered under a different sub, the existing account is NOT taken over —
+// a new account is created and the email conflict is handled by prefixing.
+// This prevents account takeover via email reuse at a different IdP.
+func (s *Store) GetOrCreateUserBySub(sub, email, name string) (*models.User, error) {
+	// First: try to find by sub
+	var u models.User
+	err := s.db.QueryRow(`SELECT id, email, name, role FROM users WHERE oidc_sub = ?`, sub).Scan(&u.ID, &u.Email, &u.Name, &u.Role)
+	if err == nil {
+		return &u, nil
+	}
+	if err != sql.ErrNoRows {
+		return nil, err
+	}
+	// Not found by sub. Check if email is already in use by a different sub.
+	var existingSub *string
+	err = s.db.QueryRow(`SELECT oidc_sub FROM users WHERE email = ?`, email).Scan(&existingSub)
+	if err == nil {
+		// Email exists but with a different sub — don't take over the account.
+		// Create a new account with a modified email to prevent identity confusion.
+		email = sub[:min(len(sub), 8)] + "-" + email
+	} else if err != sql.ErrNoRows {
+		return nil, err
+	}
+	// Create new user with sub
+	u.ID = generateID()
+	u.Email = email
+	u.Name = name
+	u.Role = "member"
+	u.OIDCSub = sub
+	_, err = s.db.Exec(`INSERT INTO users (id, email, name, role, oidc_sub) VALUES (?, ?, ?, ?, ?) ON CONFLICT(oidc_sub) DO NOTHING`, u.ID, u.Email, u.Name, u.Role, sub)
+	if err != nil {
+		return nil, err
+	}
+	// Re-select to get the row
+	err = s.db.QueryRow(`SELECT id, email, name, role FROM users WHERE oidc_sub = ?`, sub).Scan(&u.ID, &u.Email, &u.Name, &u.Role)
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // --- Helpers ---
 
 type flagData struct {
@@ -789,6 +850,19 @@ func (s *Store) GetUserOrgRole(userID, orgID string) (string, error) {
 func (s *Store) GetUserByEmail(email string) (*models.User, error) {
 	var u models.User
 	err := s.db.QueryRow(`SELECT id, email, name, role FROM users WHERE email = ?`, email).Scan(&u.ID, &u.Email, &u.Name, &u.Role)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+// GetUserBySub looks up a user by their OIDC sub claim.
+func (s *Store) GetUserBySub(sub string) (*models.User, error) {
+	var u models.User
+	err := s.db.QueryRow(`SELECT id, email, name, role FROM users WHERE oidc_sub = ?`, sub).Scan(&u.ID, &u.Email, &u.Name, &u.Role)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

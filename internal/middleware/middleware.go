@@ -12,8 +12,13 @@ import (
 )
 
 // JSONResponse writes a JSON response with the given status code.
+// Sets Cache-Control: no-store to prevent caching of API responses
+// which may contain sensitive data (flag values, secrets, etc.).
 func JSONResponse(w http.ResponseWriter, code int, data any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(data)
 }
