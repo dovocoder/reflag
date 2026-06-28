@@ -8,11 +8,13 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -81,6 +83,17 @@ Example:
 		fmt.Fprintln(os.Stderr, "error: no command specified (use --dry-run to test without exec)")
 		flag.Usage()
 		os.Exit(2)
+	}
+
+	// R6-5: Warn when API key is passed via -key flag (visible in process list)
+	keyFromFlag := apiKey != "" && os.Getenv("REFLAG_API_KEY") == ""
+	if keyFromFlag {
+		fmt.Fprintln(os.Stderr, "warning: API key passed via -key flag is visible in process list; prefer REFLAG_API_KEY env var")
+	}
+
+	// R6-3: Warn on insecure HTTP scheme (except localhost/loopback)
+	if !strings.HasPrefix(apiURL, "https://") && !isLocalhost(apiURL) {
+		fmt.Fprintln(os.Stderr, "warning: API URL is not HTTPS — API key and secrets will be transmitted in cleartext")
 	}
 
 	// Fetch secrets (response is encrypted with AES-256-GCM)
@@ -282,8 +295,9 @@ func fetchSecrets(apiURL, apiKey string) (map[string]string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API returned %d: %s", resp.StatusCode, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		scrubbed := scrubBytes(body, []string{apiKey})
+		return nil, fmt.Errorf("API returned %d: %s", resp.StatusCode, string(scrubbed))
 	}
 
 	var rawResp struct {
@@ -308,11 +322,11 @@ func fetchSecrets(apiURL, apiKey string) (map[string]string, error) {
 		}
 	} else {
 		// Fallback: plain JSON response (backward compatibility)
+		// R6-1: Hard-fail on unmarshal error instead of silently proceeding
 		var plain map[string]string
-		// Re-parse the original response body — but we already consumed it.
-		// In practice, if encrypted=false, the body IS the secrets map.
-		// We handle this by re-decoding from the raw payload field.
-		_ = json.Unmarshal([]byte(rawResp.Payload), &plain)
+		if err := json.Unmarshal([]byte(rawResp.Payload), &plain); err != nil {
+			return nil, fmt.Errorf("failed to decode plaintext secrets: %w", err)
+		}
 		secrets = plain
 	}
 
@@ -379,7 +393,7 @@ func scrubCopy(dst io.Writer, src io.Reader, secrets []string) {
 }
 
 // scrubBytes replaces all occurrences of secret values in data with "***".
-// Also scrubs base64-encoded and URL-encoded variants of secrets.
+// Also scrubs base64 (StdEncoding and URLEncoding) and hex-encoded variants.
 func scrubBytes(data []byte, secrets []string) []byte {
 	result := data
 	for _, s := range secrets {
@@ -387,13 +401,33 @@ func scrubBytes(data []byte, secrets []string) []byte {
 			continue
 		}
 		result = bytes.ReplaceAll(result, []byte(s), []byte("***"))
-		// Also scrub base64-encoded variant
+		// Scrub base64-StdEncoding variant
 		b64 := base64.StdEncoding.EncodeToString([]byte(s))
 		if b64 != s && len(b64) > 3 {
 			result = bytes.ReplaceAll(result, []byte(b64), []byte("***"))
 		}
+		// R6-4: Scrub base64-URLEncoding variant (uses - and _ instead of + and /)
+		b64url := base64.URLEncoding.EncodeToString([]byte(s))
+		if b64url != s && b64url != b64 && len(b64url) > 3 {
+			result = bytes.ReplaceAll(result, []byte(b64url), []byte("***"))
+		}
+		// R6-4: Scrub hex-encoded variant
+		hexVal := hex.EncodeToString([]byte(s))
+		if hexVal != s && len(hexVal) > 3 {
+			result = bytes.ReplaceAll(result, []byte(hexVal), []byte("***"))
+		}
 	}
 	return result
+}
+
+// isLocalhost returns true if the URL points to a loopback address.
+func isLocalhost(apiURL string) bool {
+	u, err := neturl.Parse(apiURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "0.0.0.0"
 }
 
 // suppress unused import warning for crypto/rand (used indirectly via the transport crypto)

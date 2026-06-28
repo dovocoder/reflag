@@ -87,12 +87,13 @@ func main() {
 
 	// Create HTTP server
 	srv := &http.Server{
-		Addr:           ":" + cfg.Port,
-		Handler:        finalHandler,
-		ReadTimeout:    10 * time.Second,
-		WriteTimeout:   30 * time.Second,
-		IdleTimeout:   120 * time.Second,
-		MaxHeaderBytes: 1 << 20, // 1MB max header
+		Addr:              ":" + cfg.Port,
+		Handler:           finalHandler,
+		ReadTimeout:       10 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second, // R6-6: slowloris protection
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1MB max header
 	}
 
 	// Start server in goroutine
