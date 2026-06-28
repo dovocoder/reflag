@@ -227,11 +227,16 @@ func HasScope(ctx context.Context, scope string) bool {
 	}
 	return false
 }
-
 // RequireScope is middleware that checks the API key has the required scope.
+// JWT-authenticated users (admin UI) bypass scope checks — they have full access.
 func (a *AuthService) RequireScope(scope string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// JWT-authenticated users bypass scope checks
+			if UserFromContext(r.Context()) != nil {
+				next.ServeHTTP(w, r)
+				return
+			}
 			if !HasScope(r.Context(), scope) {
 				middleware.JSONError(w, http.StatusForbidden, fmt.Sprintf("API key missing required scope: %s", scope))
 				return
@@ -378,6 +383,11 @@ func (a *AuthService) ExchangeCode(code, codeVerifier string) (*models.User, str
 		return nil, "", err
 	}
 
+	// Use sub as the primary identity — email is mutable and can be reused.
+	// sub is the cryptographically verified subject identifier from the IdP.
+	if info.Sub == "" {
+		return nil, "", fmt.Errorf("OIDC userinfo missing sub claim")
+	}
 	user, err := a.store.GetOrCreateUser(info.Email, info.Name)
 	if err != nil {
 		return nil, "", err

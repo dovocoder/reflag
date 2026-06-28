@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/dovocoder/reflag/internal/models"
@@ -19,7 +20,7 @@ type Store struct {
 
 // New opens the SQLite database and runs migrations.
 func New(dbPath string) (*Store, error) {
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(on)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(on)&_pragma=busy_timeout(5000)&_pragma=wal_autocheckpoint(1000)")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
@@ -27,6 +28,10 @@ func New(dbPath string) (*Store, error) {
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	// Restrict database file permissions to owner-only
+	if dbPath != ":memory:" {
+		_ = os.Chmod(dbPath, 0600)
 	}
 	return s, nil
 }
@@ -355,6 +360,24 @@ func (s *Store) DeleteSegment(id string) error {
 	return err
 }
 
+// GetSegment returns a segment by ID (for existence checks).
+func (s *Store) GetSegment(id string) (*models.Segment, error) {
+	var seg models.Segment
+	var conditionsStr string
+	err := s.db.QueryRow(`SELECT id, key, name, description, conditions, created_at, updated_at FROM segments WHERE id = ?`, id).
+		Scan(&seg.ID, &seg.Key, &seg.Name, &seg.Description, &conditionsStr, &seg.CreatedAt, &seg.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(conditionsStr), &seg.Conditions); err != nil {
+		return nil, err
+	}
+	return &seg, nil
+}
+
 // --- API Keys ---
 
 func (s *Store) CreateAPIKey(key *models.APIKey) error {
@@ -445,6 +468,36 @@ func (s *Store) UpdateAPIKeyLastUsed(id string) error {
 func (s *Store) RevokeAPIKey(id string) error {
 	_, err := s.db.Exec(`UPDATE api_keys SET revoked = 1 WHERE id = ?`, id)
 	return err
+}
+
+// GetAPIKeyByID returns an API key by ID (for existence checks).
+func (s *Store) GetAPIKeyByID(id string) (*models.APIKey, error) {
+	var k models.APIKey
+	var scopesStr string
+	var lastUsed sql.NullTime
+	var expires sql.NullTime
+	var envID sql.NullString
+	err := s.db.QueryRow(`SELECT id, name, key_prefix, environment_id, scopes, last_used_at, expires_at, created_at, revoked FROM api_keys WHERE id = ?`, id).
+		Scan(&k.ID, &k.Name, &k.KeyPrefix, &envID, &scopesStr, &lastUsed, &expires, &k.CreatedAt, &k.Revoked)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if envID.Valid {
+		k.EnvironmentID = envID.String
+	}
+	if lastUsed.Valid {
+		k.LastUsedAt = &lastUsed.Time
+	}
+	if expires.Valid {
+		k.ExpiresAt = &expires.Time
+	}
+	if err := json.Unmarshal([]byte(scopesStr), &k.Scopes); err != nil {
+		return nil, err
+	}
+	return &k, nil
 }
 
 // --- Audit Log ---
@@ -676,6 +729,21 @@ func (s *Store) ListOrgMembers(orgID string) ([]models.OrgMember, error) {
 	return members, nil
 }
 
+// GetOrgMemberByID returns a single org member by member ID.
+// Used for authz checks in update/remove operations.
+func (s *Store) GetOrgMemberByID(memberID string) (*models.OrgMember, error) {
+	var m models.OrgMember
+	err := s.db.QueryRow(`SELECT id, user_id, org_id, role FROM org_members WHERE id = ?`, memberID).
+		Scan(&m.ID, &m.UserID, &m.OrgID, &m.Role)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
 func (s *Store) UpdateOrgMemberRole(memberID, role string) error {
 	_, err := s.db.Exec(`UPDATE org_members SET role = ? WHERE id = ?`, role, memberID)
 	return err
@@ -697,7 +765,7 @@ func (s *Store) GetUserOrgRole(userID, orgID string) (string, error) {
 
 func (s *Store) GetUserByEmail(email string) (*models.User, error) {
 	var u models.User
-	err := s.db.QueryRow(`SELECT id, email, name FROM users WHERE email = ?`, email).Scan(&u.ID, &u.Email, &u.Name)
+	err := s.db.QueryRow(`SELECT id, email, name, role FROM users WHERE email = ?`, email).Scan(&u.ID, &u.Email, &u.Name, &u.Role)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

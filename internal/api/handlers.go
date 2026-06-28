@@ -41,26 +41,27 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, loginLimiter *middleware.Ra
 	mux.HandleFunc("POST /api/auth/logout", h.logout)
 
 	// Evaluation routes (API key or JWT) — OpenFeature HTTP API
+	// R7-M6: Enforce scope-based authorization on eval/resolve routes
 	evalMux := http.NewServeMux()
-	evalMux.HandleFunc("POST /api/v1/flags/evaluate", h.evaluateFlag)
-	evalMux.HandleFunc("POST /api/v1/flags/{key}/evaluate", h.evaluateFlagByKey)
+	evalMux.Handle("POST /api/v1/flags/evaluate", h.auth.RequireScope("evaluate")(http.HandlerFunc(h.evaluateFlag)))
+	evalMux.Handle("POST /api/v1/flags/{key}/evaluate", h.auth.RequireScope("evaluate")(http.HandlerFunc(h.evaluateFlagByKey)))
 	// Type-specific evaluation endpoints
-	evalMux.HandleFunc("POST /api/v1/flags/boolean", h.evaluateBoolean)
-	evalMux.HandleFunc("POST /api/v1/flags/string", h.evaluateString)
-	evalMux.HandleFunc("POST /api/v1/flags/number", h.evaluateNumber)
-	evalMux.HandleFunc("POST /api/v1/flags/object", h.evaluateObject)
-	evalMux.HandleFunc("POST /api/v1/flags/{key}/boolean", h.evaluateBoolean)
-	evalMux.HandleFunc("POST /api/v1/flags/{key}/string", h.evaluateString)
-	evalMux.HandleFunc("POST /api/v1/flags/{key}/number", h.evaluateNumber)
-	evalMux.HandleFunc("POST /api/v1/flags/{key}/object", h.evaluateObject)
-	evalMux.HandleFunc("GET /api/v1/flags", h.listFlagsForClient)
+	evalMux.Handle("POST /api/v1/flags/boolean", h.auth.RequireScope("evaluate")(http.HandlerFunc(h.evaluateBoolean)))
+	evalMux.Handle("POST /api/v1/flags/string", h.auth.RequireScope("evaluate")(http.HandlerFunc(h.evaluateString)))
+	evalMux.Handle("POST /api/v1/flags/number", h.auth.RequireScope("evaluate")(http.HandlerFunc(h.evaluateNumber)))
+	evalMux.Handle("POST /api/v1/flags/object", h.auth.RequireScope("evaluate")(http.HandlerFunc(h.evaluateObject)))
+	evalMux.Handle("POST /api/v1/flags/{key}/boolean", h.auth.RequireScope("evaluate")(http.HandlerFunc(h.evaluateBoolean)))
+	evalMux.Handle("POST /api/v1/flags/{key}/string", h.auth.RequireScope("evaluate")(http.HandlerFunc(h.evaluateString)))
+	evalMux.Handle("POST /api/v1/flags/{key}/number", h.auth.RequireScope("evaluate")(http.HandlerFunc(h.evaluateNumber)))
+	evalMux.Handle("POST /api/v1/flags/{key}/object", h.auth.RequireScope("evaluate")(http.HandlerFunc(h.evaluateObject)))
+	evalMux.Handle("GET /api/v1/flags", h.auth.RequireScope("read")(http.HandlerFunc(h.listFlagsForClient)))
 	mux.Handle("/api/v1/flags", h.auth.AnyAuthMiddleware(evalMux))
 	mux.Handle("/api/v1/flags/", h.auth.AnyAuthMiddleware(evalMux))
 
 	// Secrets resolve routes (API key only — encrypted response)
 	resolveMux := http.NewServeMux()
-	resolveMux.HandleFunc("POST /api/v1/secrets/{key}/resolve", h.resolveSecret)
-	resolveMux.HandleFunc("POST /api/v1/secrets/resolve", h.resolveAllSecrets)
+	resolveMux.Handle("POST /api/v1/secrets/{key}/resolve", h.auth.RequireScope("resolve")(http.HandlerFunc(h.resolveSecret)))
+	resolveMux.Handle("POST /api/v1/secrets/resolve", h.auth.RequireScope("resolve")(http.HandlerFunc(h.resolveAllSecrets)))
 	mux.Handle("/api/v1/secrets/", h.auth.APIKeyMiddleware(resolveMux))
 
 	// Admin routes (JWT only) — require admin or owner role for all management operations
@@ -122,7 +123,7 @@ func (h *Handler) oidcStart(w http.ResponseWriter, r *http.Request) {
 	}
 	authURL, verifier, err := h.auth.GetAuthorizationURL(state)
 	if err != nil {
-		middleware.JSONError(w, http.StatusBadRequest, err.Error())
+		middleware.JSONError(w, http.StatusBadRequest, "failed to start OIDC flow")
 		return
 	}
 	// Set SameSite=Lax cookie for state validation
@@ -197,7 +198,8 @@ func (h *Handler) oidcCallback(w http.ResponseWriter, r *http.Request) {
 	user, token, err := h.auth.ExchangeCode(req.Code, codeVerifier)
 	if err != nil {
 		h.audit("unknown", "LOGIN_FAILED", "user", "", "OIDC exchange failed")
-		middleware.JSONError(w, http.StatusUnauthorized, err.Error())
+		// Don't leak internal error details to the client
+		middleware.JSONError(w, http.StatusUnauthorized, "OIDC authentication failed")
 		return
 	}
 	h.audit(user.Email, "LOGIN", "user", user.ID, "OIDC login")
@@ -293,7 +295,17 @@ func (h *Handler) evaluateFlagType(w http.ResponseWriter, r *http.Request, expec
 	}
 
 	// R5-4: Reject if flag type doesn't match the endpoint type
-	if flag.Type != "" && flag.Type != expectedType {
+	// R7-M5: Also reject if flag type is empty (unconfigured flag)
+	if flag.Type == "" {
+		middleware.JSONResponse(w, http.StatusOK, openfeature.ResolutionDetail{
+			Value:        req.DefaultValue,
+			Reason:       openfeature.ReasonError,
+			ErrorCode:    openfeature.ErrParseError,
+			ErrorMessage: "flag has no type configured",
+		})
+		return
+	}
+	if flag.Type != expectedType {
 		middleware.JSONResponse(w, http.StatusOK, openfeature.ResolutionDetail{
 			Value:        req.DefaultValue,
 			Reason:       openfeature.ReasonError,
@@ -434,6 +446,11 @@ func (h *Handler) listFlagsForClient(w http.ResponseWriter, r *http.Request) {
 		if ak != nil && f.Type == "secret" {
 			continue
 		}
+		// R7-M1: Hide disabled flags from API key callers — they always return
+		// the default variation and shouldn't clutter the client's flag list
+		if ak != nil && !f.Enabled {
+			continue
+		}
 		result = append(result, clientFlag{
 			Key: f.Key, Enabled: f.Enabled, Type: string(f.Type),
 		})
@@ -530,6 +547,12 @@ func (h *Handler) updateFlag(w http.ResponseWriter, r *http.Request) {
 		existing.Description = flag.Description
 	}
 	if flag.Type != "" {
+		// R7-M4: Prevent flag type changes after creation — changing type
+		// would break existing evaluation clients and invalidate cached results
+		if existing.Type != "" && flag.Type != existing.Type {
+			middleware.JSONError(w, http.StatusBadRequest, "flag type cannot be changed after creation")
+			return
+		}
 		existing.Type = flag.Type
 	}
 	if flag.Variations != nil {
@@ -557,6 +580,12 @@ func (h *Handler) updateFlag(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteFlag(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// R7-L1: Check existence before delete to return proper 404
+	existing, err := h.store.GetFlag(id)
+	if err != nil || existing == nil {
+		middleware.JSONError(w, http.StatusNotFound, "flag not found")
+		return
+	}
 	if err := h.store.DeleteFlag(id); err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to delete flag")
 		return
@@ -608,6 +637,12 @@ func (h *Handler) createEnvironment(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteEnvironment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// R7-L1: Check existence before delete
+	existing, err := h.store.GetEnvironment(id)
+	if err != nil || existing == nil {
+		middleware.JSONError(w, http.StatusNotFound, "environment not found")
+		return
+	}
 	if err := h.store.DeleteEnvironment(id); err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to delete environment")
 		return
@@ -659,6 +694,12 @@ func (h *Handler) createSegment(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteSegment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// R7-L1: Check existence before delete
+	existing, err := h.store.GetSegment(id)
+	if err != nil || existing == nil {
+		middleware.JSONError(w, http.StatusNotFound, "segment not found")
+		return
+	}
 	if err := h.store.DeleteSegment(id); err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to delete segment")
 		return
@@ -759,6 +800,12 @@ func (h *Handler) createAPIKey(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) revokeAPIKey(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// R7-L1: Check existence before revoke
+	existing, err := h.store.GetAPIKeyByID(id)
+	if err != nil || existing == nil {
+		middleware.JSONError(w, http.StatusNotFound, "API key not found")
+		return
+	}
 	if err := h.store.RevokeAPIKey(id); err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to revoke API key")
 		return
@@ -887,6 +934,12 @@ func (h *Handler) createOrg(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteOrg(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// R7-L1: Check existence before delete
+	existing, err := h.store.GetOrg(id)
+	if err != nil || existing == nil {
+		middleware.JSONError(w, http.StatusNotFound, "organization not found")
+		return
+	}
 	if err := h.store.DeleteOrg(id); err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to delete org")
 		return
@@ -966,26 +1019,19 @@ func (h *Handler) addOrgMember(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) updateOrgMemberRole(w http.ResponseWriter, r *http.Request) {
 	memberID := r.PathValue("memberId")
+	// R7-H1: Always verify the member exists (regardless of admin role)
+	member, err := h.store.GetOrgMemberByID(memberID)
+	if err != nil || member == nil {
+		middleware.JSONError(w, http.StatusNotFound, "member not found")
+		return
+	}
 	// Check that the authenticated user is admin/owner of the member's org (or hardcoded admin)
 	user := auth.UserFromContext(r.Context())
 	if user != nil && user.ID != "admin" {
-		// Fetch the member to find the orgID, then check role
-		members, err := h.store.ListOrgMembers("")
-		if err == nil {
-			var orgID string
-			for _, m := range members {
-				if m.ID == memberID {
-					orgID = m.OrgID
-					break
-				}
-			}
-			if orgID != "" {
-				role, err := h.store.GetUserOrgRole(user.ID, orgID)
-				if err != nil || (role != "owner" && role != "admin") {
-					middleware.JSONError(w, http.StatusForbidden, "insufficient permissions — must be org admin or owner")
-					return
-				}
-			}
+		role, err := h.store.GetUserOrgRole(user.ID, member.OrgID)
+		if err != nil || (role != "owner" && role != "admin") {
+			middleware.JSONError(w, http.StatusForbidden, "insufficient permissions — must be org admin or owner")
+			return
 		}
 	}
 	var req struct {
@@ -1013,25 +1059,19 @@ func (h *Handler) updateOrgMemberRole(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) removeOrgMember(w http.ResponseWriter, r *http.Request) {
 	memberID := r.PathValue("memberId")
+	// R7-H1: Always verify the member exists (regardless of admin role)
+	member, err := h.store.GetOrgMemberByID(memberID)
+	if err != nil || member == nil {
+		middleware.JSONError(w, http.StatusNotFound, "member not found")
+		return
+	}
 	// Check that the authenticated user is admin/owner of the member's org (or hardcoded admin)
 	user := auth.UserFromContext(r.Context())
 	if user != nil && user.ID != "admin" {
-		members, err := h.store.ListOrgMembers("")
-		if err == nil {
-			var orgID string
-			for _, m := range members {
-				if m.ID == memberID {
-					orgID = m.OrgID
-					break
-				}
-			}
-			if orgID != "" {
-				role, err := h.store.GetUserOrgRole(user.ID, orgID)
-				if err != nil || (role != "owner" && role != "admin") {
-					middleware.JSONError(w, http.StatusForbidden, "insufficient permissions — must be org admin or owner")
-					return
-				}
-			}
+		role, err := h.store.GetUserOrgRole(user.ID, member.OrgID)
+		if err != nil || (role != "owner" && role != "admin") {
+			middleware.JSONError(w, http.StatusForbidden, "insufficient permissions — must be org admin or owner")
+			return
 		}
 	}
 	if err := h.store.RemoveOrgMember(memberID); err != nil {
@@ -1325,6 +1365,16 @@ func (h *Handler) updateSecret(w http.ResponseWriter, r *http.Request) {
 		existing.EncryptedValue = encrypted
 	}
 	if req.EnvironmentID != "" {
+		// Validate environment_id exists
+		env, _ := h.store.GetEnvironment(req.EnvironmentID)
+		if env == nil {
+			env, _ = h.store.GetEnvironmentByKey(req.EnvironmentID)
+			if env == nil {
+				middleware.JSONError(w, http.StatusBadRequest, "environment_id does not reference an existing environment")
+				return
+			}
+			req.EnvironmentID = env.ID
+		}
 		existing.EnvironmentID = req.EnvironmentID
 	}
 
@@ -1345,6 +1395,12 @@ func (h *Handler) updateSecret(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) deleteSecret(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// R7-L1: Check existence before delete
+	existing, err := h.store.GetSecret(id)
+	if err != nil || existing == nil {
+		middleware.JSONError(w, http.StatusNotFound, "secret not found")
+		return
+	}
 	if err := h.store.DeleteSecret(id); err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to delete secret")
 		return
