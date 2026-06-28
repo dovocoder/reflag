@@ -60,6 +60,9 @@ export function navigate(path: string) {
 
 function App() {
   const [route, setRoute] = useState<Route>(parseRoute);
+  const [userRole, setUserRole] = useState<string | undefined>(() => {
+    return sessionStorage.getItem("reflag_role") || undefined;
+  });
 
   useEffect(() => {
     const handler = () => setRoute(parseRoute());
@@ -73,7 +76,7 @@ function App() {
     return (
       <StrictMode>
         <QueryClientProvider client={queryClient}>
-          <LoginPage onLogin={() => handleNavigate("/flags")} />
+          <LoginPage onLogin={() => handleNavigate("/flags")} onRoleChange={setUserRole} />
         </QueryClientProvider>
       </StrictMode>
     );
@@ -115,8 +118,11 @@ function App() {
         <Layout
           current={route.page}
           onNavigate={handleNavigate}
+          userRole={userRole}
           onLogout={() => {
             clearToken();
+            sessionStorage.removeItem("reflag_role");
+            setUserRole(undefined);
             handleNavigate("/login");
           }}
         >

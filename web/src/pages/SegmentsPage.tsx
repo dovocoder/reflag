@@ -14,7 +14,15 @@ export function SegmentsPage() {
   const [form, setForm] = useState({ key: "", name: "", description: "", conditions: "[]" });
 
   const createMutation = useMutation({
-    mutationFn: () => { const conditions: Condition[] = JSON.parse(form.conditions || "[]"); return api.createSegment({ key: form.key, name: form.name, description: form.description, conditions }); },
+    mutationFn: () => {
+      let conditions: Condition[];
+      try {
+        conditions = JSON.parse(form.conditions || "[]");
+      } catch {
+        throw new Error("Invalid JSON in conditions field");
+      }
+      return api.createSegment({ key: form.key, name: form.name, description: form.description, conditions });
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["segments"] });
       setForm({ key: "", name: "", description: "", conditions: "[]" });

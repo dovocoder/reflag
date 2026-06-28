@@ -6,20 +6,23 @@ interface LayoutProps {
   current: string;
   onNavigate: (path: string) => void;
   onLogout: () => void;
+  userRole?: string;
   children: React.ReactNode;
 }
 
 const navItems = [
-  { page: "flags", path: "/flags", label: "Flags", icon: Flag },
-  { page: "environments", path: "/environments", label: "Environments", icon: Globe },
-  { page: "segments", path: "/segments", label: "Segments", icon: Users },
-  { page: "secrets", path: "/secrets", label: "Secrets", icon: Lock },
-  { page: "api-keys", path: "/api-keys", label: "API Keys", icon: Key },
-  { page: "organizations", path: "/organizations", label: "Orgs", icon: Building2 },
-  { page: "audit", path: "/audit", label: "Audit", icon: ScrollText },
+  { page: "flags", path: "/flags", label: "Flags", icon: Flag, adminOnly: false },
+  { page: "environments", path: "/environments", label: "Environments", icon: Globe, adminOnly: false },
+  { page: "segments", path: "/segments", label: "Segments", icon: Users, adminOnly: false },
+  { page: "secrets", path: "/secrets", label: "Secrets", icon: Lock, adminOnly: true },
+  { page: "api-keys", path: "/api-keys", label: "API Keys", icon: Key, adminOnly: true },
+  { page: "organizations", path: "/organizations", label: "Orgs", icon: Building2, adminOnly: true },
+  { page: "audit", path: "/audit", label: "Audit", icon: ScrollText, adminOnly: true },
 ];
 
-export function Layout({ current, onNavigate, onLogout, children }: LayoutProps) {
+export function Layout({ current, onNavigate, onLogout, userRole, children }: LayoutProps) {
+  const isAdmin = userRole === "admin" || userRole === "owner";
+  const visibleNav = navItems.filter(item => !item.adminOnly || isAdmin);
   return (
     <div className="min-h-screen flex">
       {/* Desktop Sidebar */}
@@ -29,7 +32,7 @@ export function Layout({ current, onNavigate, onLogout, children }: LayoutProps)
           <p className="text-xs text-[var(--color-muted-foreground)]">Feature Flags & Config</p>
         </div>
         <nav className="flex-1 p-2 space-y-1">
-          {navItems.map((item) => {
+          {visibleNav.map((item) => {
             const Icon = item.icon;
             const active = current === item.page;
             return (
@@ -73,7 +76,7 @@ export function Layout({ current, onNavigate, onLogout, children }: LayoutProps)
 
       {/* Mobile Bottom Nav */}
       <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-50 bg-[var(--color-sidebar)] border-t border-[var(--color-sidebar-border)] h-14 flex items-center justify-around">
-        {navItems.slice(0, 5).map((item) => {
+        {visibleNav.slice(0, 5).map((item) => {
           const Icon = item.icon;
           const active = current === item.page;
           return (
@@ -104,7 +107,7 @@ function MobileNav({ current, onNavigate, onLogout }: { current: string; onNavig
       </button>
       {open && (
         <div className="absolute top-14 right-0 w-48 bg-[var(--color-popover)] border border-[var(--color-border)] rounded-md shadow-lg py-1">
-          {navItems.map((item) => {
+          {visibleNav.map((item) => {
             const Icon = item.icon;
             const active = current === item.page;
             return (

@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
 import { Input, Label } from "@/components/ui/form";
 
-export function LoginPage({ onLogin }: { onLogin: () => void }) {
+export function LoginPage({ onLogin, onRoleChange }: { onLogin: () => void; onRoleChange?: (role: string | undefined) => void }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
@@ -19,8 +19,12 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
     try {
       setLoading(true);
       setError("");
-      const { token } = await api.adminLogin({ email, password });
+      const { token, user } = await api.adminLogin({ email, password });
       setToken(token);
+      if (user?.role) {
+        sessionStorage.setItem("reflag_role", user.role);
+        onRoleChange?.(user.role);
+      }
       onLogin();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
@@ -33,6 +37,12 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
     try {
       setLoading(true);
       const { authorization_url } = await api.oidcStart();
+      // R6-F1: Validate OIDC redirect URL before navigating
+      const url = new URL(authorization_url);
+      if (!url.protocol.startsWith("https")) {
+        setError("OIDC provider URL must use HTTPS");
+        return;
+      }
       window.location.href = authorization_url;
     } catch (err) {
       setError(err instanceof Error ? err.message : "OIDC login failed");
@@ -46,6 +56,8 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
     const params = new URLSearchParams(window.location.search);
     const code = params.get("code");
     if (code) {
+      // R6-F4: Strip code from URL to prevent history/referer leakage
+      history.replaceState({}, "", window.location.pathname);
       handleCallback(code);
     }
   }, []);
@@ -57,10 +69,15 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code }),
+        credentials: "include", // R6-F4: ensure cookie is set
       });
       const data = await res.json();
       if (data.token) {
         setToken(data.token);
+        if (data.user?.role) {
+          sessionStorage.setItem("reflag_role", data.user.role);
+          onRoleChange?.(data.user.role);
+        }
         onLogin();
       } else {
         setError(data.error || "Authentication failed");
