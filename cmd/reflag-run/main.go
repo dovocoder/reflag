@@ -321,13 +321,10 @@ func fetchSecrets(apiURL, apiKey string) (map[string]string, error) {
 			return nil, fmt.Errorf("failed to decode decrypted secrets: %w", err)
 		}
 	} else {
-		// Fallback: plain JSON response (backward compatibility)
-		// R6-1: Hard-fail on unmarshal error instead of silently proceeding
-		var plain map[string]string
-		if err := json.Unmarshal([]byte(rawResp.Payload), &plain); err != nil {
-			return nil, fmt.Errorf("failed to decode plaintext secrets: %w", err)
-		}
-		secrets = plain
+		// R13-M2: Hard-fail on unencrypted response — the server should always
+		// encrypt secret responses. Accepting plaintext would allow a MITM
+		// to strip encryption and intercept secret values.
+		return nil, fmt.Errorf("server returned unencrypted response — refusing to process (possible MITM)")
 	}
 
 	return secrets, nil
