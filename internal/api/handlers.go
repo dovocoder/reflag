@@ -957,7 +957,13 @@ func (h *Handler) createOrg(w http.ResponseWriter, r *http.Request) {
 			OrgID:  org.ID,
 			Role:   "owner",
 		}
-		_ = h.store.AddOrgMember(member)
+		if err := h.store.AddOrgMember(member); err != nil {
+			// R14-M1: Don't silently swallow — roll back the org creation
+			// to prevent orphaned orgs with no owner
+			_ = h.store.DeleteOrg(org.ID)
+			middleware.JSONError(w, http.StatusInternalServerError, "failed to create organization membership")
+			return
+		}
 	}
 	h.audit(auth.ActorFromContext(r.Context()), "CREATE", "organization", org.ID, org.Name)
 	middleware.JSONResponse(w, http.StatusCreated, org)
