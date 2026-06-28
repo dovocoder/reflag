@@ -486,6 +486,11 @@ func (h *Handler) createFlag(w http.ResponseWriter, r *http.Request) {
 		middleware.JSONError(w, http.StatusBadRequest, "key must be alphanumeric with dashes/underscores, max 128 chars")
 		return
 	}
+	// R8-H1/H2/H3/M5: Validate flag configuration consistency
+	if msg := validateFlagConfig(&flag); msg != "" {
+		middleware.JSONError(w, http.StatusBadRequest, msg)
+		return
+	}
 	if len(flag.Name) > 256 {
 		middleware.JSONError(w, http.StatusBadRequest, "name too long (max 256 chars)")
 		return
@@ -570,7 +575,16 @@ func (h *Handler) updateFlag(w http.ResponseWriter, r *http.Request) {
 	existing.ID = id
 	// Auto-increment version (never allow user-controlled version regression)
 	existing.Version = existing.Version + 1
+	// R8-H1/H2/H3/M5: Validate flag configuration consistency after merge
+	if msg := validateFlagConfig(existing); msg != "" {
+		middleware.JSONError(w, http.StatusBadRequest, msg)
+		return
+	}
 	if err := h.store.UpdateFlag(existing); err != nil {
+		if strings.Contains(err.Error(), "concurrent modification") {
+			middleware.JSONError(w, http.StatusConflict, "flag was modified by another request — please retry")
+			return
+		}
 		middleware.JSONError(w, http.StatusInternalServerError, "failed to update flag")
 		return
 	}
@@ -904,6 +918,10 @@ func (h *Handler) createOrg(w http.ResponseWriter, r *http.Request) {
 		middleware.JSONError(w, http.StatusBadRequest, "name and slug are required")
 		return
 	}
+	if len(org.Name) > 256 {
+		middleware.JSONError(w, http.StatusBadRequest, "name too long (max 256 chars)")
+		return
+	}
 	if !isValidKey(org.Slug) {
 		middleware.JSONError(w, http.StatusBadRequest, "slug must be alphanumeric with dashes/underscores, max 128 chars")
 		return
@@ -1084,6 +1102,55 @@ func (h *Handler) removeOrgMember(w http.ResponseWriter, r *http.Request) {
 
 // --- Helpers ---
 
+// isValidFlagType checks if a flag type is a recognized OpenFeature type.
+var validFlagTypes = map[models.FlagType]bool{
+	models.FlagTypeBoolean: true,
+	models.FlagTypeString:  true,
+	models.FlagTypeNumber:  true,
+	models.FlagTypeObject:  true,
+	models.FlagTypeSecret:  true,
+}
+
+func isValidFlagType(t models.FlagType) bool {
+	return validFlagTypes[t]
+}
+
+// validateFlagConfig validates the internal consistency of a flag's configuration.
+// Checks: type is known, at least one variation, variation IDs are unique,
+// and all rule/default variation_id references point to existing variations.
+func validateFlagConfig(flag *models.Flag) string {
+	if !isValidFlagType(flag.Type) {
+		return fmt.Sprintf("invalid flag type %q — must be one of: boolean, string, number, object, secret", flag.Type)
+	}
+	if len(flag.Variations) == 0 {
+		return "flag must have at least one variation"
+	}
+	// Check variation ID uniqueness
+	seen := make(map[string]bool, len(flag.Variations))
+	for _, v := range flag.Variations {
+		if v.ID == "" {
+			return "variation ID cannot be empty"
+		}
+		if seen[v.ID] {
+			return fmt.Sprintf("duplicate variation ID: %s", v.ID)
+		}
+		seen[v.ID] = true
+	}
+	// Validate default_rule references an existing variation
+	if flag.DefaultRule != nil && flag.DefaultRule.VariationID != "" {
+		if !seen[flag.DefaultRule.VariationID] {
+			return fmt.Sprintf("default_rule references unknown variation: %s", flag.DefaultRule.VariationID)
+		}
+	}
+	// Validate targeting rules reference existing variations
+	for _, rule := range flag.Targeting {
+		if rule.VariationID != "" && !seen[rule.VariationID] {
+			return fmt.Sprintf("targeting rule %q references unknown variation: %s", rule.Name, rule.VariationID)
+		}
+	}
+	return ""
+}
+
 // isValidFlagKey validates that a flag key contains only safe characters.
 func isValidFlagKey(key string) bool {
 	if len(key) == 0 || len(key) > 128 {
@@ -1233,6 +1300,10 @@ func (h *Handler) createSecret(w http.ResponseWriter, r *http.Request) {
 	}
 	if !isValidKey(req.Key) {
 		middleware.JSONError(w, http.StatusBadRequest, "key must be alphanumeric with dashes/underscores, max 128 chars")
+		return
+	}
+	if len(req.Name) > 256 {
+		middleware.JSONError(w, http.StatusBadRequest, "name too long (max 256 chars)")
 		return
 	}
 	if req.Value == "" {

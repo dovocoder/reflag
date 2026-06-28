@@ -276,9 +276,19 @@ func (s *Store) UpdateFlag(flag *models.Flag) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`UPDATE flags SET key=?, name=?, description=?, type=?, enabled=?, version=?, data=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-		flag.Key, flag.Name, flag.Description, flag.Type, boolToInt(flag.Enabled), flag.Version, string(data), flag.ID)
-	return err
+	// R8-M1: Optimistic concurrency control — only update if the version
+	// in the DB matches what we read. Prevents lost updates from concurrent
+	// requests. Returns ErrNoRows if version mismatch (caller checks rows affected).
+	res, err := s.db.Exec(`UPDATE flags SET key=?, name=?, description=?, type=?, enabled=?, version=?, data=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND version=?`,
+		flag.Key, flag.Name, flag.Description, flag.Type, boolToInt(flag.Enabled), flag.Version, string(data), flag.ID, flag.Version-1)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("concurrent modification detected")
+	}
+	return nil
 }
 
 func (s *Store) DeleteFlag(id string) error {
@@ -512,6 +522,9 @@ func (s *Store) ListAuditEntries(limit, offset int) ([]models.AuditLogEntry, err
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
+	if offset < 0 {
+		offset = 0
+	}
 	rows, err := s.db.Query(`SELECT id, actor, action, resource, resource_id, details, timestamp FROM audit_log ORDER BY timestamp DESC LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
 		return nil, err
@@ -604,8 +617,13 @@ func generateID() string {
 // --- Secrets ---
 
 func (s *Store) CreateSecret(secret *models.Secret) error {
+	// R8-H4: Use NULL for empty environment_id to avoid FK constraint failure
+	var envID any
+	if secret.EnvironmentID != "" {
+		envID = secret.EnvironmentID
+	}
 	_, err := s.db.Exec(`INSERT INTO secrets (id, key, name, description, encrypted_value, environment_id) VALUES (?, ?, ?, ?, ?, ?)`,
-		secret.ID, secret.Key, secret.Name, secret.Description, secret.EncryptedValue, secret.EnvironmentID)
+		secret.ID, secret.Key, secret.Name, secret.Description, secret.EncryptedValue, envID)
 	return err
 }
 
@@ -653,8 +671,13 @@ func (s *Store) GetSecretByKey(key string) (*models.Secret, error) {
 }
 
 func (s *Store) UpdateSecret(secret *models.Secret) error {
+	// R8-H4: Use NULL for empty environment_id to avoid FK constraint failure
+	var envID any
+	if secret.EnvironmentID != "" {
+		envID = secret.EnvironmentID
+	}
 	_, err := s.db.Exec(`UPDATE secrets SET key=?, name=?, description=?, encrypted_value=?, environment_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-		secret.Key, secret.Name, secret.Description, secret.EncryptedValue, secret.EnvironmentID, secret.ID)
+		secret.Key, secret.Name, secret.Description, secret.EncryptedValue, envID, secret.ID)
 	return err
 }
 

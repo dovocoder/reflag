@@ -603,6 +603,10 @@ func (a *AuthService) verifyIDToken(idToken string) error {
 	if claims.ExpiresAt != nil && time.Now().After(claims.ExpiresAt.Time) {
 		return fmt.Errorf("ID token expired")
 	}
+	// R8-M2: Check not-before claim — reject tokens that are not yet valid
+	if claims.NotBefore != nil && time.Now().Before(claims.NotBefore.Time) {
+		return fmt.Errorf("ID token not yet valid")
+	}
 	// Fetch JWKS and verify signature
 	jwksResp, err := a.httpClient.Get(d.JWKSURI)
 	if err != nil {
