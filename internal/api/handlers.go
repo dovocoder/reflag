@@ -1546,17 +1546,15 @@ func (h *Handler) resolveAllSecrets(w http.ResponseWriter, r *http.Request) {
 		middleware.JSONError(w, http.StatusForbidden, "API key must be scoped to an environment")
 		return
 	}
-	secrets, err := h.store.ListSecrets()
+	// R12-M2: Query only secrets for this environment — more efficient and
+	// prevents timing-based information leakage about secret names in other envs
+	secrets, err := h.store.ListSecretsByEnvironment(apiKey.EnvironmentID)
 	if err != nil {
 		middleware.JSONError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 	result := make(map[string]string)
 	for _, s := range secrets {
-		// Scope secrets by API key's environment ID
-		if s.EnvironmentID != apiKey.EnvironmentID {
-			continue
-		}
 		decrypted, err := crypto.Decrypt(s.EncryptedValue, h.secretsKey)
 		if err != nil {
 			continue

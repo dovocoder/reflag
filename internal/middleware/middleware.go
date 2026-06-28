@@ -314,12 +314,38 @@ func CSRFMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// allowedHosts is a set of hostnames that the server considers valid for
+// CSRF Origin checks. Configured via SERVER_HOST env var. When not set,
+// falls back to r.Host (less secure — only use behind a trusted reverse proxy).
+var allowedHosts sync.Map
+
+func init() {
+	if h := os.Getenv("SERVER_HOST"); h != "" {
+		for _, host := range strings.Split(h, ",") {
+			allowedHosts.Store(strings.TrimSpace(host), true)
+		}
+	}
+}
+
 func isSameOrigin(origin string, r *http.Request) bool {
-	// Parse origin URL and compare only host (ignoring path/trailing slash)
+	// Parse origin URL and compare host
 	u, err := url.Parse(origin)
 	if err != nil {
 		return false
 	}
+	// R12-M1: If SERVER_HOST is configured, validate against it rather than
+	// r.Host (which is client-controlled and can be spoofed on direct exposure)
+	hasConfiguredHosts := false
+	allowedHosts.Range(func(key, val any) bool {
+		hasConfiguredHosts = true
+		return false
+	})
+	if hasConfiguredHosts {
+		_, ok := allowedHosts.Load(u.Host)
+		return ok
+	}
+	// Fallback: compare against r.Host (safe behind a trusted reverse proxy
+	// like Traefik that overwrites the Host header)
 	return u.Host == r.Host
 }
 

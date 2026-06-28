@@ -702,6 +702,30 @@ func (s *Store) ListSecrets() ([]models.Secret, error) {
 	return secrets, nil
 }
 
+// ListSecretsByEnvironment returns only secrets scoped to the given environment.
+// R12-M2: More efficient and prevents information leakage via timing when
+// resolveAllSecrets only needs secrets for one environment.
+func (s *Store) ListSecretsByEnvironment(envID string) ([]models.Secret, error) {
+	rows, err := s.db.Query(`SELECT id, key, name, description, encrypted_value, environment_id, created_at, updated_at FROM secrets WHERE environment_id = ? ORDER BY created_at DESC`, envID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var secrets []models.Secret
+	for rows.Next() {
+		var sec models.Secret
+		var envIDStr sql.NullString
+		if err := rows.Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &envIDStr, &sec.CreatedAt, &sec.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if envIDStr.Valid {
+			sec.EnvironmentID = envIDStr.String
+		}
+		secrets = append(secrets, sec)
+	}
+	return secrets, nil
+}
+
 func (s *Store) GetSecret(id string) (*models.Secret, error) {
 	var sec models.Secret
 	var envID sql.NullString
