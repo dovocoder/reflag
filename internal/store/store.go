@@ -624,13 +624,6 @@ func (s *Store) GetOrCreateUserBySub(sub, email, name string) (*models.User, err
 	return &u, nil
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // --- Helpers ---
 
 type flagData struct {
@@ -697,8 +690,12 @@ func (s *Store) ListSecrets() ([]models.Secret, error) {
 	var secrets []models.Secret
 	for rows.Next() {
 		var sec models.Secret
-		if err := rows.Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &sec.EnvironmentID, &sec.CreatedAt, &sec.UpdatedAt); err != nil {
+		var envID sql.NullString
+		if err := rows.Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &envID, &sec.CreatedAt, &sec.UpdatedAt); err != nil {
 			return nil, err
+		}
+		if envID.Valid {
+			sec.EnvironmentID = envID.String
 		}
 		secrets = append(secrets, sec)
 	}
@@ -707,26 +704,34 @@ func (s *Store) ListSecrets() ([]models.Secret, error) {
 
 func (s *Store) GetSecret(id string) (*models.Secret, error) {
 	var sec models.Secret
+	var envID sql.NullString
 	err := s.db.QueryRow(`SELECT id, key, name, description, encrypted_value, environment_id, created_at, updated_at FROM secrets WHERE id = ?`, id).
-		Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &sec.EnvironmentID, &sec.CreatedAt, &sec.UpdatedAt)
+		Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &envID, &sec.CreatedAt, &sec.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
+	}
+	if envID.Valid {
+		sec.EnvironmentID = envID.String
 	}
 	return &sec, nil
 }
 
 func (s *Store) GetSecretByKey(key string) (*models.Secret, error) {
 	var sec models.Secret
+	var envID sql.NullString
 	err := s.db.QueryRow(`SELECT id, key, name, description, encrypted_value, environment_id, created_at, updated_at FROM secrets WHERE key = ?`, key).
-		Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &sec.EnvironmentID, &sec.CreatedAt, &sec.UpdatedAt)
+		Scan(&sec.ID, &sec.Key, &sec.Name, &sec.Description, &sec.EncryptedValue, &envID, &sec.CreatedAt, &sec.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
+	}
+	if envID.Valid {
+		sec.EnvironmentID = envID.String
 	}
 	return &sec, nil
 }
