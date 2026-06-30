@@ -55,20 +55,21 @@ export function LoginPage({ onLogin, onRoleChange }: { onLogin: () => void; onRo
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const code = params.get("code");
+    const state = params.get("state");
     if (code) {
       // R6-F4: Strip code from URL to prevent history/referer leakage
       history.replaceState({}, "", window.location.pathname);
-      handleCallback(code);
+      handleCallback(code, state || "");
     }
   }, []);
 
-  const handleCallback = async (code: string) => {
+  const handleCallback = async (code: string, state: string) => {
     try {
       setLoading(true);
       const res = await fetch("/api/auth/oidc/callback", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code }),
+        body: JSON.stringify({ code, state }),
         credentials: "include", // R6-F4: ensure cookie is set
       });
       const data = await res.json();
