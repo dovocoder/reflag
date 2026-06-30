@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -51,6 +52,10 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, loginLimiter *middleware.Ra
 	// Public routes (no auth)
 	mux.HandleFunc("GET /health", h.health)
 	mux.HandleFunc("GET /api/auth/oidc/status", h.oidcStatus)
+	// GET callback: IdP redirects here with ?code=...&state=... — redirect
+	// to the frontend /login page which handles the actual POST exchange.
+	// This supports both /api/auth/oidc/callback and /login as redirect URIs.
+	mux.HandleFunc("GET /api/auth/oidc/callback", h.oidcCallbackRedirect)
 	// Login and OIDC callback have stricter rate limiting
 	mux.Handle("POST /api/auth/login", middleware.RateLimitMiddleware(loginLimiter, http.HandlerFunc(h.adminLogin)))
 	mux.HandleFunc("POST /api/auth/oidc/start", h.oidcStart)
@@ -141,6 +146,26 @@ func (h *Handler) oidcStatus(w http.ResponseWriter, r *http.Request) {
 	middleware.JSONResponse(w, http.StatusOK, map[string]any{
 		"available": h.auth.IsOIDCConfigured(),
 	})
+}
+
+// oidcCallbackRedirect handles GET requests from the IdP redirect.
+// It forwards the code and state query params to the frontend /login page,
+// which reads them and POSTs to the API callback endpoint for the token
+// exchange. This keeps the redirect URI flexible — both /login and
+// /api/auth/oidc/callback work as registered redirect URIs in the IdP.
+func (h *Handler) oidcCallbackRedirect(w http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	state := r.URL.Query().Get("state")
+	if code == "" {
+		http.Redirect(w, r, "/login", http.StatusFound)
+		return
+	}
+	// Forward code and state as query params to the frontend login page
+	target := "/login?code=" + url.QueryEscape(code)
+	if state != "" {
+		target += "&state=" + url.QueryEscape(state)
+	}
+	http.Redirect(w, r, target, http.StatusFound)
 }
 
 func (h *Handler) oidcStart(w http.ResponseWriter, r *http.Request) {
