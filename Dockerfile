@@ -19,7 +19,7 @@ RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o reflag-run ./cmd/reflag-run/
 # --- Stage 3: Runtime ---
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata wget && \
-    adduser -S -D -H -h /app app
+    addgroup -S app && adduser -S -G app -h /app app
 
 WORKDIR /app
 COPY --from=go-builder /app/reflag /app/reflag
