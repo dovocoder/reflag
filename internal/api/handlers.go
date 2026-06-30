@@ -50,6 +50,7 @@ func (h *Handler) segmentResolver() openfeature.SegmentResolver {
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, loginLimiter *middleware.RateLimiter) {
 	// Public routes (no auth)
 	mux.HandleFunc("GET /health", h.health)
+	mux.HandleFunc("GET /api/auth/oidc/status", h.oidcStatus)
 	// Login and OIDC callback have stricter rate limiting
 	mux.Handle("POST /api/auth/login", middleware.RateLimitMiddleware(loginLimiter, http.HandlerFunc(h.adminLogin)))
 	mux.HandleFunc("POST /api/auth/oidc/start", h.oidcStart)
@@ -135,6 +136,12 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- OIDC Auth ---
+
+func (h *Handler) oidcStatus(w http.ResponseWriter, r *http.Request) {
+	middleware.JSONResponse(w, http.StatusOK, map[string]any{
+		"available": h.auth.IsOIDCConfigured(),
+	})
+}
 
 func (h *Handler) oidcStart(w http.ResponseWriter, r *http.Request) {
 	state, err := h.auth.GenerateState()

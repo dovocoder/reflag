@@ -11,8 +11,35 @@ export function LoginPage({ onLogin, onRoleChange }: { onLogin: () => void; onRo
   const [error, setError] = useState("");
   const [oidcAvailable, setOidcAvailable] = useState(false);
 
+  // Handle OIDC callback FIRST — before any other effect that might
+  // call oidcStart and overwrite the state/PKCE cookies.
+  // This runs only when the URL contains ?code=... (redirect from IdP).
+  const [callbackHandled, setCallbackHandled] = useState(false);
+
   useEffect(() => {
-    api.oidcStart().then(() => setOidcAvailable(true)).catch(() => setOidcAvailable(false));
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get("code");
+    const state = params.get("state");
+    if (code && !callbackHandled) {
+      // R6-F4: Strip code from URL to prevent history/referer leakage
+      history.replaceState({}, "", window.location.pathname);
+      setCallbackHandled(true);
+      handleCallback(code, state || "");
+    }
+  }, [callbackHandled]);
+
+  // Check OIDC availability using the side-effect-free status endpoint.
+  // NEVER call oidcStart here — it sets state/PKCE cookies and would
+  // clobber the cookies from the actual OIDC flow if a callback is in progress.
+  useEffect(() => {
+    // Don't check availability while processing a callback
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("code")) return;
+
+    fetch("/api/auth/oidc/status")
+      .then((res) => res.json())
+      .then((data) => setOidcAvailable(data.available === true))
+      .catch(() => setOidcAvailable(false));
   }, []);
 
   const handleAdminLogin = async () => {
@@ -50,18 +77,6 @@ export function LoginPage({ onLogin, onRoleChange }: { onLogin: () => void; onRo
       setLoading(false);
     }
   };
-
-  // Handle OIDC callback
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const code = params.get("code");
-    const state = params.get("state");
-    if (code) {
-      // R6-F4: Strip code from URL to prevent history/referer leakage
-      history.replaceState({}, "", window.location.pathname);
-      handleCallback(code, state || "");
-    }
-  }, []);
 
   const handleCallback = async (code: string, state: string) => {
     try {

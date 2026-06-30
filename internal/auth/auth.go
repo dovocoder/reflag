@@ -242,6 +242,14 @@ func (a *AuthService) RequireScope(scope string) func(http.Handler) http.Handler
 
 // --- OIDC ---
 
+// IsOIDCConfigured returns true if the OIDC issuer and client credentials
+// are set. This is a lightweight check that does NOT make network requests
+// or set cookies — use it for availability checks (e.g. showing the OIDC
+// button on the login page) instead of calling oidcStart.
+func (a *AuthService) IsOIDCConfigured() bool {
+	return a.oidcIssuer != "" && a.oidcClientID != "" && a.oidcRedirect != ""
+}
+
 func (a *AuthService) GetDiscovery() (*OIDCDiscovery, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
