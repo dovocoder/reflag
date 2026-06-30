@@ -256,8 +256,11 @@ func (h *Handler) oidcCallback(w http.ResponseWriter, r *http.Request) {
 	user, token, err := h.auth.ExchangeCode(req.Code, codeVerifier)
 	if err != nil {
 		h.audit("unknown", "LOGIN_FAILED", "user", "", "OIDC exchange failed")
-		// Don't leak internal error details to the client
-		middleware.JSONError(w, http.StatusUnauthorized, "OIDC authentication failed")
+		// Log the real error for debugging — don't leak to client
+		fmt.Printf("[OIDC] exchange failed: %v\n", err)
+		// Return the actual error in development for debugging
+		// TODO: remove before production
+		middleware.JSONError(w, http.StatusUnauthorized, fmt.Sprintf("OIDC authentication failed: %v", err))
 		return
 	}
 	h.audit(user.Email, "LOGIN", "user", user.ID, "OIDC login")
