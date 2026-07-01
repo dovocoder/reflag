@@ -680,7 +680,7 @@ func (a *AuthService) verifyIDToken(idToken string) (*jwt.RegisteredClaims, erro
 		return nil, fmt.Errorf("signing key not found in JWKS for kid %s", kid)
 	}
 	// Verify the token signature using the JWKS key
-	verified, err := jwt.Parse(idToken, func(t *jwt.Token) (any, error) {
+	verified, err := jwt.ParseWithClaims(idToken, &jwt.RegisteredClaims{}, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
